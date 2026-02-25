@@ -192,6 +192,14 @@ class HierarchicalG1Env:
             device=device,
         )
 
+        # -- Create arm controller (14 arm joints, pose-based) --
+        from ..low_level.arm_controller import ArmController
+
+        self.arm_controller = ArmController(
+            num_envs=num_envs,
+            device=device,
+        )
+
         # Joint index mappings (set after first reset when articulation is ready)
         self._body_joint_ids: Optional[torch.Tensor] = None
         self._finger_joint_ids: Optional[torch.Tensor] = None
