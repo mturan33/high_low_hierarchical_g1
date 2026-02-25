@@ -49,19 +49,32 @@ class WalkToSkill(BaseSkill):
         # Target
         self._target_pos: Optional[torch.Tensor] = None
 
-    def reset(self, target_x: float, target_y: float, **kwargs) -> None:
+    def reset(
+        self,
+        target_x: float = None,
+        target_y: float = None,
+        target_positions: torch.Tensor = None,
+        **kwargs,
+    ) -> None:
         """
         Initialize walk_to skill.
 
         Args:
-            target_x: Target X position (world frame, meters)
-            target_y: Target Y position (world frame, meters)
+            target_x: Target X position for all envs (world frame, meters)
+            target_y: Target Y position for all envs (world frame, meters)
+            target_positions: Per-env targets [num_envs, 2] (overrides target_x/y)
         """
         super().reset()
-        self._target_pos = torch.tensor(
-            [[target_x, target_y]], dtype=torch.float32, device=self.device
-        )
-        print(f"[WalkTo] Target: ({target_x:.2f}, {target_y:.2f})")
+        if target_positions is not None:
+            self._target_pos = target_positions.to(dtype=torch.float32, device=self.device)
+            print(f"[WalkTo] Per-env targets: {self._target_pos.shape[0]} envs")
+        elif target_x is not None and target_y is not None:
+            self._target_pos = torch.tensor(
+                [[target_x, target_y]], dtype=torch.float32, device=self.device
+            )
+            print(f"[WalkTo] Target: ({target_x:.2f}, {target_y:.2f})")
+        else:
+            raise ValueError("Must provide target_positions or (target_x, target_y)")
 
     def step(
         self, obs_dict: dict[str, torch.Tensor]
@@ -89,14 +102,16 @@ class WalkToSkill(BaseSkill):
 
         # Check if robot fell
         if (base_height < MIN_BASE_HEIGHT).any():
-            zero_cmd = torch.zeros(1, 3, device=self.device)
+            zero_cmd = torch.zeros(robot_pos_xy.shape[0], 3, device=self.device)
             return zero_cmd, True, self._make_failure(
                 reason="Robot fell",
-                base_height=base_height.item(),
+                base_height=base_height.min().item(),
             )
 
-        # Expand target for num_envs
-        target = self._target_pos.expand(robot_pos_xy.shape[0], -1)
+        # Expand target for num_envs (handles both single and per-env targets)
+        target = self._target_pos
+        if target.shape[0] == 1 and robot_pos_xy.shape[0] > 1:
+            target = target.expand(robot_pos_xy.shape[0], -1)
 
         # Compute velocity command
         cmd_vel, distance = self.cmd_gen.compute_walk_command(
