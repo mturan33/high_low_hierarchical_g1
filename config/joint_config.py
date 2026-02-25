@@ -58,6 +58,59 @@ ARM_JOINT_NAMES = ARM_JOINT_NAMES_LEFT + ARM_JOINT_NAMES_RIGHT  # 14 joints
 ALL_JOINT_NAMES = LEG_JOINT_NAMES + WAIST_JOINT_NAMES + ARM_JOINT_NAMES  # 29 joints
 
 # ============================================================================
+# DEX3 FINGER JOINT NAMES (7 per hand, 14 total)
+# ============================================================================
+
+DEX3_JOINT_NAMES_LEFT = [
+    "left_hand_index_0_joint",    # 0
+    "left_hand_index_1_joint",    # 1
+    "left_hand_middle_0_joint",   # 2
+    "left_hand_middle_1_joint",   # 3
+    "left_hand_thumb_0_joint",    # 4
+    "left_hand_thumb_1_joint",    # 5
+    "left_hand_thumb_2_joint",    # 6
+]  # 7 joints
+
+DEX3_JOINT_NAMES_RIGHT = [
+    "right_hand_index_0_joint",   # 0
+    "right_hand_index_1_joint",   # 1
+    "right_hand_middle_0_joint",  # 2
+    "right_hand_middle_1_joint",  # 3
+    "right_hand_thumb_0_joint",   # 4
+    "right_hand_thumb_1_joint",   # 5
+    "right_hand_thumb_2_joint",   # 6
+]  # 7 joints
+
+DEX3_JOINT_NAMES = DEX3_JOINT_NAMES_LEFT + DEX3_JOINT_NAMES_RIGHT  # 14 joints
+NUM_DEX3_JOINTS = len(DEX3_JOINT_NAMES)       # 14
+NUM_DEX3_JOINTS_PER_HAND = 7
+
+# Full 43-DoF joint list (body + fingers)
+ALL_JOINT_NAMES_DEX3 = ALL_JOINT_NAMES + DEX3_JOINT_NAMES  # 43 joints
+NUM_ALL_JOINTS_DEX3 = 43
+
+# Finger close positions (radians) — empirical values for power grasp
+DEX3_FINGER_OPEN = {j: 0.0 for j in DEX3_JOINT_NAMES}
+DEX3_FINGER_CLOSE = {
+    # Left hand
+    "left_hand_index_0_joint": 0.8,
+    "left_hand_index_1_joint": 1.0,
+    "left_hand_middle_0_joint": 0.8,
+    "left_hand_middle_1_joint": 1.0,
+    "left_hand_thumb_0_joint": 0.6,
+    "left_hand_thumb_1_joint": 0.8,
+    "left_hand_thumb_2_joint": 0.6,
+    # Right hand
+    "right_hand_index_0_joint": 0.8,
+    "right_hand_index_1_joint": 1.0,
+    "right_hand_middle_0_joint": 0.8,
+    "right_hand_middle_1_joint": 1.0,
+    "right_hand_thumb_0_joint": 0.6,
+    "right_hand_thumb_1_joint": 0.8,
+    "right_hand_thumb_2_joint": 0.6,
+}
+
+# ============================================================================
 # JOINT COUNTS
 # ============================================================================
 
