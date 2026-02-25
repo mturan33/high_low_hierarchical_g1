@@ -203,10 +203,7 @@ class HierarchicalG1Env:
         self._initial_pos: Optional[torch.Tensor] = None
         self._is_reset = False
 
-        total_dof = self.robot.num_joints
         print(f"[HierarchicalG1Env] {num_envs} envs, device={device}")
-        print(f"[HierarchicalG1Env] Robot: {total_dof} DoF "
-              f"(29 body + {total_dof - 29} fingers)")
         print(f"[HierarchicalG1Env] Control: {1.0/self.control_dt:.0f} Hz "
               f"({self.decimation}x decimation)")
 
