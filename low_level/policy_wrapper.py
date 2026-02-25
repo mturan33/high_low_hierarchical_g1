@@ -5,16 +5,20 @@ Loads a trained RSL-RL checkpoint from unitree_rl_lab and provides
 a clean inference interface for the skill layer.
 
 The policy expects:
-  - Observation: 96 dims per frame × 5 history frames = 480 dims
+  - Observation: 480 dims (6 terms × 5 history frames, per-term stacking)
   - Action: 29 joint position targets (scaled by 0.25)
 
-Observation vector per frame (96 dims):
-  [0:3]   base_ang_vel (scaled by 0.2)
-  [3:6]   projected_gravity
-  [6:9]   velocity_commands [vx, vy, vyaw]
-  [9:38]  joint_pos_rel (current - default)
-  [38:67] joint_vel_rel (scaled by 0.05)
-  [67:96] last_action
+Observation layout (per-term history stacking, matching IsaacLab ObservationManager):
+  [0:15]    base_ang_vel × 5 history   (3×5, scaled by 0.2)
+  [15:30]   projected_gravity × 5      (3×5)
+  [30:45]   velocity_commands × 5      (3×5)
+  [45:190]  joint_pos_rel × 5          (29×5)
+  [190:335] joint_vel_rel × 5          (29×5, scaled by 0.05)
+  [335:480] last_action × 5            (29×5)
+
+IMPORTANT: IsaacLab uses per-term stacking (each term's history is flattened
+independently, then all terms are concatenated). This is different from
+per-frame stacking where full observation frames are concatenated.
 """
 
 from __future__ import annotations
@@ -35,6 +39,13 @@ from config.joint_config import (
     DEFAULT_JOINT_LIST,
     OBS_SCALES,
 )
+
+# Observation term sizes in order (must match velocity_env_cfg.py PolicyCfg)
+OBS_TERM_SIZES = [3, 3, 3, 29, 29, 29]  # ang_vel, gravity, cmd, jpos, jvel, action
+OBS_TERM_NAMES = [
+    "base_ang_vel", "projected_gravity", "velocity_commands",
+    "joint_pos_rel", "joint_vel_rel", "last_action",
+]
 
 
 class LocomotionPolicy:
@@ -69,8 +80,11 @@ class LocomotionPolicy:
             DEFAULT_JOINT_LIST, dtype=torch.float32, device=self.device
         ).unsqueeze(0).expand(num_envs, -1)
 
-        # Observation history buffer (deque of last N frames)
-        self.obs_history: deque[torch.Tensor] = deque(maxlen=OBS_HISTORY_LENGTH)
+        # Per-term history buffers (matching IsaacLab's per-term CircularBuffer)
+        # Each term has its own deque of length OBS_HISTORY_LENGTH
+        self._term_history: list[deque] = [
+            deque(maxlen=OBS_HISTORY_LENGTH) for _ in OBS_TERM_SIZES
+        ]
 
         # Previous action buffer
         self.prev_action = torch.zeros(
@@ -85,67 +99,70 @@ class LocomotionPolicy:
         print(f"[LocomotionPolicy] Obs: {OBS_DIM_PER_FRAME}×{OBS_HISTORY_LENGTH}={OBS_DIM_TOTAL}, Act: {ACTION_DIM}")
 
     def _load_policy(self, checkpoint_path: str) -> torch.nn.Module:
-        """Load RSL-RL ActorCritic policy from checkpoint."""
+        """
+        Load trained actor network from RSL-RL checkpoint.
+
+        The checkpoint contains the full ActorCritic state dict. We extract
+        only the actor weights and build a standalone nn.Sequential for inference.
+        This avoids dependency on the RSL-RL ActorCritic constructor API (which
+        changed across versions).
+
+        Architecture (from unitree_rl_lab training config):
+          Actor: 480 -> 512 -> ELU -> 256 -> ELU -> 128 -> ELU -> 29
+        """
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-        # RSL-RL saves the full model state dict
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
-        # Try loading as JIT model first (exported policy)
-        if checkpoint_path.endswith(".pt") or checkpoint_path.endswith(".jit"):
-            try:
-                model = torch.jit.load(checkpoint_path, map_location=self.device)
-                model.eval()
-                print("[LocomotionPolicy] Loaded as TorchScript model")
-                return model
-            except Exception:
-                pass
+        # Extract model state dict
+        if "model_state_dict" in checkpoint:
+            full_state_dict = checkpoint["model_state_dict"]
+        else:
+            full_state_dict = checkpoint
 
-        # Load as RSL-RL ActorCritic state dict
-        try:
-            from rsl_rl.modules import ActorCritic
+        # Build actor network matching the trained architecture
+        # Keys in checkpoint: actor.0.weight (512,480), actor.2.weight (256,512),
+        #   actor.4.weight (128,256), actor.6.weight (29,128)
+        # This is nn.Sequential: [Linear, ELU, Linear, ELU, Linear, ELU, Linear]
+        actor_hidden_dims = [512, 256, 128]
+        layers = []
+        input_dim = OBS_DIM_TOTAL  # 480
+        for hidden_dim in actor_hidden_dims:
+            layers.append(torch.nn.Linear(input_dim, hidden_dim))
+            layers.append(torch.nn.ELU())
+            input_dim = hidden_dim
+        layers.append(torch.nn.Linear(input_dim, ACTION_DIM))  # output layer
 
-            # Reconstruct network architecture (must match training config)
-            # unitree_rl_lab uses: actor=[512,256,128], critic=[512,256,128], ELU
-            model = ActorCritic(
-                num_actor_obs=OBS_DIM_TOTAL,
-                num_critic_obs=OBS_DIM_TOTAL,
-                num_actions=ACTION_DIM,
-                actor_hidden_dims=[512, 256, 128],
-                critic_hidden_dims=[512, 256, 128],
-                activation="elu",
-                init_noise_std=1.0,
-            )
+        actor = torch.nn.Sequential(*layers)
 
-            # Load weights
-            if "model_state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["model_state_dict"])
-            else:
-                model.load_state_dict(checkpoint)
+        # Load only the actor weights from the full state dict
+        actor_state_dict = {}
+        for key, value in full_state_dict.items():
+            if key.startswith("actor."):
+                actor_state_dict[key[len("actor."):]] = value
 
-            model.to(self.device)
-            model.eval()
-            print("[LocomotionPolicy] Loaded as RSL-RL ActorCritic")
-            return model
+        actor.load_state_dict(actor_state_dict)
+        actor.to(self.device)
+        actor.eval()
 
-        except ImportError:
-            raise ImportError(
-                "rsl_rl not found. Install with: pip install rsl_rl"
-            )
+        print(f"[LocomotionPolicy] Actor: {OBS_DIM_TOTAL} -> {actor_hidden_dims} -> {ACTION_DIM}")
+        print(f"[LocomotionPolicy] Iteration: {checkpoint.get('iter', 'unknown')}")
+        return actor
 
     def reset(self, env_ids: Optional[torch.Tensor] = None):
         """Reset observation history and previous actions for given envs."""
         if env_ids is None:
-            self.obs_history.clear()
+            for buf in self._term_history:
+                buf.clear()
             self.prev_action.zero_()
         else:
-            # Partial reset — zero out the prev_action for specified envs
+            # Partial reset -- zero out the prev_action for specified envs
             self.prev_action[env_ids] = 0.0
-            # For history, we can't partially reset a deque easily,
-            # so we zero out those env rows in all history frames
-            for i, frame in enumerate(self.obs_history):
-                frame[env_ids] = 0.0
+            # Zero out those env rows in all history frames for each term
+            for buf in self._term_history:
+                for frame in buf:
+                    frame[env_ids] = 0.0
 
     def _build_observation(
         self,
@@ -156,42 +173,44 @@ class LocomotionPolicy:
         velocity_command: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Build single-frame observation vector (96 dims).
+        Build the full 480-dim observation using per-term history stacking.
+
+        IsaacLab's ObservationManager stacks history PER-TERM (each term's
+        CircularBuffer is flattened independently), NOT per-frame. The final
+        observation is: [term0_history(size0×5), term1_history(size1×5), ...]
 
         All inputs should be [num_envs, dim] tensors on self.device.
         """
-        # Apply observation scales
-        ang_vel_scaled = base_ang_vel * OBS_SCALES["ang_vel"]
-        joint_vel_scaled = joint_vel * OBS_SCALES["joint_vel"]
+        n = base_ang_vel.shape[0]
 
-        # Joint positions relative to default
-        joint_pos_rel = joint_pos - self.default_joint_pos[:base_ang_vel.shape[0]]
+        # Compute current observation terms (order must match velocity_env_cfg.py PolicyCfg)
+        current_terms = [
+            base_ang_vel * OBS_SCALES["ang_vel"],           # [n, 3]  scaled by 0.2
+            projected_gravity,                               # [n, 3]
+            velocity_command,                                # [n, 3]
+            joint_pos - self.default_joint_pos[:n],          # [n, 29] relative to default
+            joint_vel * OBS_SCALES["joint_vel"],             # [n, 29] scaled by 0.05
+            self.prev_action[:n].clone(),                    # [n, 29]
+        ]
 
-        # Concatenate: [ang_vel(3), gravity(3), cmd(3), jpos(29), jvel(29), prev_act(29)] = 96
-        obs_frame = torch.cat([
-            ang_vel_scaled,       # 3
-            projected_gravity,    # 3
-            velocity_command,     # 3
-            joint_pos_rel,        # 29
-            joint_vel_scaled,     # 29
-            self.prev_action[:base_ang_vel.shape[0]],  # 29
-        ], dim=-1)
-
-        return obs_frame  # [num_envs, 96]
-
-    def _stack_history(self, current_frame: torch.Tensor) -> torch.Tensor:
-        """Stack observation history (5 frames) into flat vector."""
-        self.obs_history.append(current_frame.clone())
+        # Append each term to its own history buffer
+        for i, term_val in enumerate(current_terms):
+            self._term_history[i].append(term_val.clone())
 
         # Pad with zeros if not enough history yet
-        while len(self.obs_history) < OBS_HISTORY_LENGTH:
-            self.obs_history.appendleft(
-                torch.zeros_like(current_frame)
-            )
+        for i, buf in enumerate(self._term_history):
+            while len(buf) < OBS_HISTORY_LENGTH:
+                buf.appendleft(torch.zeros(n, OBS_TERM_SIZES[i],
+                                           dtype=torch.float32, device=self.device))
 
-        # Stack: oldest first → newest last
-        stacked = torch.cat(list(self.obs_history), dim=-1)
-        return stacked  # [num_envs, 480]
+        # Per-term stacking: flatten each term's history, then concatenate all terms
+        # This matches IsaacLab's: circular_buffer.buffer.reshape(num_envs, -1)
+        stacked_terms = []
+        for buf in self._term_history:
+            # [t-4, t-3, t-2, t-1, t] -> [n, size*5]
+            stacked_terms.append(torch.cat(list(buf), dim=-1))
+
+        return torch.cat(stacked_terms, dim=-1)  # [num_envs, 480]
 
     @torch.no_grad()
     def get_action(
@@ -216,17 +235,14 @@ class LocomotionPolicy:
             joint_targets: Joint position targets [num_envs, 29]
                           (absolute positions, not relative to default)
         """
-        # Build current frame observation
-        obs_frame = self._build_observation(
+        # Build full 480-dim observation with per-term history stacking
+        obs_stacked = self._build_observation(
             base_ang_vel, projected_gravity,
             joint_pos, joint_vel, velocity_command,
         )
 
-        # Stack with history
-        obs_stacked = self._stack_history(obs_frame)
-
-        # Run policy
-        action = self.policy.act_inference(obs_stacked)
+        # Run actor network directly (standalone nn.Sequential)
+        action = self.policy(obs_stacked)
 
         # Store for next frame's observation
         self.prev_action[:action.shape[0]] = action.clone()
