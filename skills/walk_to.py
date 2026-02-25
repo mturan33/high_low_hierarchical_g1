@@ -19,9 +19,9 @@ import torch
 from typing import Optional
 
 from .base_skill import BaseSkill, SkillResult, SkillStatus
-from low_level.velocity_command import VelocityCommandGenerator, get_yaw_from_quat
-from config.skill_config import WalkToConfig
-from config.joint_config import MIN_BASE_HEIGHT
+from ..low_level.velocity_command import VelocityCommandGenerator, get_yaw_from_quat
+from ..config.skill_config import WalkToConfig
+from ..config.joint_config import MIN_BASE_HEIGHT
 
 
 class WalkToSkill(BaseSkill):

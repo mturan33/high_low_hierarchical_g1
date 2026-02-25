@@ -41,14 +41,16 @@ import torch
 
 import isaaclab.sim as sim_utils
 
-# Add package root to path for local imports
-PKG_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PKG_ROOT not in sys.path:
-    sys.path.insert(0, PKG_ROOT)
+# Add parent of high_low_hierarchical_g1 to path so package imports work
+# (avoids collision with OpenCV's config module)
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # high_low_hierarchical_g1/
+_PKG_PARENT = os.path.dirname(_PKG_DIR)  # direct/
+if _PKG_PARENT not in sys.path:
+    sys.path.insert(0, _PKG_PARENT)
 
-from envs.hierarchical_env import HierarchicalG1Env, HierarchicalSceneCfg, PHYSICS_DT
-from skills.walk_to import WalkToSkill
-from config.skill_config import WalkToConfig
+from high_low_hierarchical_g1.envs.hierarchical_env import HierarchicalG1Env, HierarchicalSceneCfg, PHYSICS_DT
+from high_low_hierarchical_g1.skills.walk_to import WalkToSkill
+from high_low_hierarchical_g1.config.skill_config import WalkToConfig
 
 
 def main():

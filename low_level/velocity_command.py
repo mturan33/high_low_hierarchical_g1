@@ -13,7 +13,7 @@ import torch
 import math
 from typing import Optional
 
-from config.joint_config import CMD_RANGE_LIMIT
+from ..config.joint_config import CMD_RANGE_LIMIT
 
 
 def normalize_angle(angle: torch.Tensor) -> torch.Tensor:

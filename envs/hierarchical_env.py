@@ -29,8 +29,6 @@ Usage:
 
 from __future__ import annotations
 
-import os
-import sys
 import torch
 from typing import Optional
 
@@ -162,10 +160,7 @@ class HierarchicalG1Env:
         self.cup: RigidObject = self.scene["cup"]
 
         # -- Load locomotion policy --
-        pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if pkg_root not in sys.path:
-            sys.path.insert(0, pkg_root)
-        from low_level.policy_wrapper import LocomotionPolicy
+        from ..low_level.policy_wrapper import LocomotionPolicy
 
         self.loco_policy = LocomotionPolicy(
             checkpoint_path=checkpoint_path,

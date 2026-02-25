@@ -16,7 +16,7 @@ import torch
 from typing import Optional
 
 from .base_skill import BaseSkill, SkillResult, SkillStatus
-from config.skill_config import HeuristicGraspConfig, HeuristicPlaceConfig
+from ..config.skill_config import HeuristicGraspConfig, HeuristicPlaceConfig
 
 
 class HeuristicGraspSkill(BaseSkill):

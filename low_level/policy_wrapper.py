@@ -29,7 +29,7 @@ import numpy as np
 from collections import deque
 from typing import Optional
 
-from config.joint_config import (
+from ..config.joint_config import (
     NUM_ALL_JOINTS,
     OBS_DIM_PER_FRAME,
     OBS_HISTORY_LENGTH,

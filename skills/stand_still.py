@@ -11,8 +11,8 @@ import torch
 from typing import Optional
 
 from .base_skill import BaseSkill, SkillResult, SkillStatus
-from config.skill_config import StandStillConfig
-from config.joint_config import MIN_BASE_HEIGHT, CONTROL_DT
+from ..config.skill_config import StandStillConfig
+from ..config.joint_config import MIN_BASE_HEIGHT, CONTROL_DT
 
 
 class StandStillSkill(BaseSkill):
