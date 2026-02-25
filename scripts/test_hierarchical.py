@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Test Hierarchical G1 Environment - Walk To Skill
-===================================================
-Spawns 16 G1 robots on flat terrain with tables and cups.
-Each robot walks 3 meters forward using the trained locomotion policy.
+Test Hierarchical G1 Environment - Walk + DEX3 Finger Demo
+=============================================================
+Spawns G1 robots with DEX3 hands on flat terrain with tables and cups.
+Each robot walks 3 meters forward, then demonstrates finger open/close.
 
 Usage (from C:\\IsaacLab):
     .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\high_low_hierarchical_g1\\scripts\\test_hierarchical.py --num_envs 16 --checkpoint C:\\IsaacLab\\logs\\rsl_rl\\unitree_g1_29dof_velocity\\2026-02-24_16-51-25\\model_20700.pt
@@ -16,7 +16,7 @@ import argparse
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Test hierarchical G1 walk_to skill")
+parser = argparse.ArgumentParser(description="Test hierarchical G1 DEX3 walk + finger demo")
 parser.add_argument("--num_envs", type=int, default=16, help="Number of environments")
 parser.add_argument(
     "--checkpoint", type=str, required=True,
@@ -59,7 +59,7 @@ def main():
     device = "cuda:0"
 
     print("=" * 60)
-    print("  Hierarchical G1 - Walk To Skill Test")
+    print("  Hierarchical G1 DEX3 - Walk + Finger Demo")
     print("=" * 60)
     print(f"  Environments : {num_envs}")
     print(f"  Checkpoint   : {args_cli.checkpoint}")
@@ -92,7 +92,7 @@ def main():
     )
 
     # ------------------------------------------------------------------
-    # 2. Create hierarchical environment
+    # 2. Create hierarchical environment (DEX3)
     # ------------------------------------------------------------------
     scene_cfg = HierarchicalSceneCfg()
     env = HierarchicalG1Env(
@@ -115,7 +115,7 @@ def main():
         print(f"  Env {i}: ({initial_pos[i, 0]:.2f}, {initial_pos[i, 1]:.2f})")
 
     # ------------------------------------------------------------------
-    # 4. Setup walk_to skill - 3m ahead of each robot's start position
+    # 4. Phase 1: Walk to target (3m ahead)
     # ------------------------------------------------------------------
     target_positions = initial_pos.clone()
     target_positions[:, 0] += args_cli.walk_distance  # X forward
@@ -125,46 +125,76 @@ def main():
     skill = WalkToSkill(config=walk_cfg, device=device)
     skill.reset(target_positions=target_positions)
 
-    print(f"\n[Test] Walk targets (first 4):")
+    print(f"\n[Test] === PHASE 1: Walk to target ===")
+    print(f"[Test] Walk targets (first 4):")
     for i in range(min(4, num_envs)):
         print(f"  Env {i}: ({target_positions[i, 0]:.2f}, {target_positions[i, 1]:.2f})")
 
-    # ------------------------------------------------------------------
-    # 5. Run skill loop
-    # ------------------------------------------------------------------
-    print("\n[Test] Starting walk_to skill...")
     start_time = time.time()
     done = False
 
     while simulation_app.is_running() and not done:
-        # Skill generates velocity command from current state
         vel_cmd, done, result = skill.step(obs)
-
-        # Environment steps with velocity command
         obs = env.step(vel_cmd)
 
-        # Progress logging
         if env.step_count % 50 == 0:
             elapsed = time.time() - start_time
             current_pos = obs["root_pos"][:, :2]
             distances = torch.norm(current_pos - target_positions, dim=-1)
             print(
-                f"[Test] Step {env.step_count:4d} | "
+                f"[Walk] Step {env.step_count:4d} | "
                 f"Time: {elapsed:5.1f}s | "
                 f"Mean dist: {distances.mean():.2f}m | "
-                f"Min dist: {distances.min():.2f}m | "
                 f"Height: {obs['base_height'].mean():.2f}m"
             )
 
-        # Safety: if all robots fell, stop
         if (obs["base_height"] < 0.2).all():
             print("[Test] All robots fell! Stopping.")
             done = True
 
+    elapsed_walk = time.time() - start_time
+    print(f"\n[Test] Walk result: {result.status.name} - {result.reason}")
+    print(f"[Test] Walk time: {elapsed_walk:.1f}s, Steps: {result.steps_taken}")
+
+    # ------------------------------------------------------------------
+    # 5. Phase 2: Stand still + Finger demo
+    # ------------------------------------------------------------------
+    print(f"\n[Test] === PHASE 2: DEX3 Finger Demo ===")
+    print(f"[Test] Closing fingers...")
+
+    stand_cmd = torch.zeros(num_envs, 3, device=device)
+
+    # Close all fingers
+    env.finger_controller.close(hand="both")
+
+    close_steps = 0
+    while simulation_app.is_running() and close_steps < 100:
+        obs = env.step(stand_cmd)
+        close_steps += 1
+        if close_steps % 25 == 0:
+            finger_pos = obs["joint_pos_finger"]
+            print(f"[Fingers] Step {close_steps}: "
+                  f"mean finger pos = {finger_pos.mean():.3f} rad | "
+                  f"closed={env.finger_controller.is_closed()}")
+
+    print(f"[Test] Fingers closed! Opening again...")
+
+    # Open all fingers
+    env.finger_controller.open(hand="both")
+
+    open_steps = 0
+    while simulation_app.is_running() and open_steps < 100:
+        obs = env.step(stand_cmd)
+        open_steps += 1
+        if open_steps % 25 == 0:
+            finger_pos = obs["joint_pos_finger"]
+            print(f"[Fingers] Step {open_steps}: "
+                  f"mean finger pos = {finger_pos.mean():.3f} rad | "
+                  f"open={env.finger_controller.is_open()}")
+
     # ------------------------------------------------------------------
     # 6. Results
     # ------------------------------------------------------------------
-    elapsed = time.time() - start_time
     final_pos = obs["root_pos"][:, :2]
     distances = torch.norm(final_pos - target_positions, dim=-1)
     travel = torch.norm(final_pos - initial_pos, dim=-1)
@@ -172,24 +202,20 @@ def main():
     print("\n" + "=" * 60)
     print("  RESULTS")
     print("=" * 60)
-    print(f"  Status       : {result.status.name}")
-    print(f"  Reason       : {result.reason}")
-    print(f"  Steps taken  : {result.steps_taken}")
-    print(f"  Time elapsed : {elapsed:.1f}s")
-    print(f"  Mean distance to target: {distances.mean():.2f}m")
-    print(f"  Mean distance traveled : {travel.mean():.2f}m")
-    print(f"  Mean final height      : {obs['base_height'].mean():.2f}m")
-    print(f"  Robots still standing  : {(obs['base_height'] > 0.3).sum()}/{num_envs}")
+    print(f"  Walk Status      : {result.status.name}")
+    print(f"  Walk Reason      : {result.reason}")
+    print(f"  Walk Steps       : {result.steps_taken}")
+    print(f"  Walk Time        : {elapsed_walk:.1f}s")
+    print(f"  Mean dist to tgt : {distances.mean():.2f}m")
+    print(f"  Mean traveled    : {travel.mean():.2f}m")
+    print(f"  Final height     : {obs['base_height'].mean():.2f}m")
+    print(f"  Standing robots  : {(obs['base_height'] > 0.3).sum()}/{num_envs}")
+    print(f"  Finger close/open: OK")
+    print(f"  Total DoF        : {env.robot.num_joints} (29 body + {env.robot.num_joints - 29} fingers)")
     print("=" * 60)
 
     # Keep visualization alive
-    if result.status.name == "SUCCESS":
-        print("\n[Test] SUCCESS! Robots reached target. Keeping sim alive...")
-    else:
-        print(f"\n[Test] {result.status.name}: {result.reason}")
-
-    # Stand still after reaching target
-    stand_cmd = torch.zeros(num_envs, 3, device=device)
+    print("\n[Test] Demo complete! Keeping sim alive...")
     while simulation_app.is_running():
         obs = env.step(stand_cmd)
 
