@@ -38,7 +38,7 @@ parser.add_argument(
     "--arm_checkpoint", type=str, default=None,
     help="Path to Stage 7 arm policy checkpoint (.pt file). If provided, uses learned arm control.",
 )
-parser.add_argument("--walk_distance", type=float, default=3.0, help="Walk distance in meters")
+parser.add_argument("--walk_distance", type=float, default=3.2, help="Walk distance in meters")
 parser.add_argument("--max_steps", type=int, default=2000, help="Maximum walk steps before timeout")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -59,6 +59,7 @@ import torch
 sys.stdout.reconfigure(line_buffering=True)
 
 import isaaclab.sim as sim_utils
+from isaaclab.utils.math import quat_apply_inverse, quat_apply
 
 # Add parent of high_low_hierarchical_g1 to path so package imports work
 _PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -215,31 +216,83 @@ def main():
         env.set_manipulation_mode(True)
         env.enable_arm_policy(True)
 
-        # Set target to cup position (or table center if no cup)
-        cup_pos = env.cup.data.root_pos_w.mean(dim=0)  # [3]
-        print(f"  Target (cup): [{cup_pos[0]:.2f}, {cup_pos[1]:.2f}, {cup_pos[2]:.2f}]")
-        env.set_arm_target_world(cup_pos.unsqueeze(0).expand(num_envs, -1))
+        # Compute a REACHABLE target within the arm's workspace.
+        # Stage 7 was trained on targets within 0.18-0.35m of the shoulder.
+        # The cup at 3.5m is ~0.5-0.7m from the EE -- too far!
+        # Strategy: compute target in body frame clamped to reachable distance,
+        # in the direction of the cup from the right shoulder.
+        #
+        # Right shoulder offset in body frame (from arm_policy_wrapper.py)
+        shoulder_offset = torch.tensor([0.0, -0.174, 0.259], device=device)
+        max_reach = 0.32  # within Stage 7 training workspace
+
+        # Get each env's cup position and robot state
+        cup_pos_all = env.cup.data.root_pos_w.clone()  # [N, 3]
+        root_pos = env.robot.data.root_pos_w
+        root_quat = env.robot.data.root_quat_w
+
+        # Compute cup position in body frame
+        cup_body = quat_apply_inverse(root_quat, cup_pos_all - root_pos)
+        print(f"  Cup (body frame env0): [{cup_body[0, 0]:.3f}, {cup_body[0, 1]:.3f}, {cup_body[0, 2]:.3f}]")
+
+        # Compute direction from shoulder to cup in body frame
+        cup_from_shoulder = cup_body - shoulder_offset.unsqueeze(0)
+        dist_from_shoulder = cup_from_shoulder.norm(dim=-1, keepdim=True)
+        print(f"  Cup distance from shoulder: {dist_from_shoulder.mean():.3f}m (max reach: {max_reach}m)")
+
+        # Clamp to reachable workspace -- target on line from shoulder to cup
+        scale = torch.clamp(max_reach / (dist_from_shoulder + 1e-6), max=1.0)
+        reachable_target_body = shoulder_offset.unsqueeze(0) + cup_from_shoulder * scale
+        print(f"  Reachable target (body env0): [{reachable_target_body[0, 0]:.3f}, "
+              f"{reachable_target_body[0, 1]:.3f}, {reachable_target_body[0, 2]:.3f}]")
+
+        # Convert reachable target to world frame for set_arm_target_world
+        reachable_target_world = quat_apply(root_quat, reachable_target_body) + root_pos
+        env.set_arm_target_world(reachable_target_world)
         env.reset_arm_policy_state()
 
-        for step in range(300):
+        # Phase 3a: Active reaching (limited steps to prevent OOD divergence)
+        reach_steps = 80
+        best_ee_dist = float('inf')
+        for step in range(reach_steps):
             if not simulation_app.is_running():
                 break
 
             obs = env.step_arm_policy(stand_cmd)
 
-            if step % 50 == 0:
+            # Track best distance
+            ee_world, _ = env._compute_palm_ee()
+            ee_dist = (ee_world - env._arm_target_world).norm(dim=-1).mean().item()
+            best_ee_dist = min(best_ee_dist, ee_dist)
+
+            if step % 20 == 0:
                 h = obs["base_height"].mean().item()
                 standing = (obs["base_height"] > 0.5).sum().item()
-                # Show EE distance to target
-                ee_world, _ = env._compute_palm_ee()
-                ee_dist = (ee_world - cup_pos.unsqueeze(0)).norm(dim=-1).mean().item()
+                arm_pos = env.robot.data.joint_pos[:, env._arm_policy_joint_idx]
                 print(f"  [Reach] Step {step:4d} | Height: {h:.2f}m | "
-                      f"Standing: {standing}/{num_envs} | EE dist: {ee_dist:.3f}m")
+                      f"Standing: {standing}/{num_envs} | "
+                      f"EE dist: {ee_dist:.3f}m | "
+                      f"arm[0]: [{arm_pos[0, 0]:.2f}, {arm_pos[0, 1]:.2f}, "
+                      f"{arm_pos[0, 2]:.2f}, {arm_pos[0, 3]:.2f}, {arm_pos[0, 4]:.2f}]")
+
+        print(f"  [Reach] Best EE dist during reach: {best_ee_dist:.3f}m")
+
+        # Phase 3b: Hold position (freeze arm at current position, continue loco)
+        print(f"  [Reach] Holding arm position...")
+        env.enable_arm_policy(False)  # Switch to heuristic but keep current pose
+        # Capture current arm positions as hold targets
+        hold_arm_targets = env.robot.data.joint_pos[:, env._arm_idx].clone()
+        for step in range(100):
+            if not simulation_app.is_running():
+                break
+            obs = env.step_manipulation(stand_cmd, hold_arm_targets)
 
         # Final EE distance
         ee_world, _ = env._compute_palm_ee()
-        final_ee_dist = (ee_world - cup_pos.unsqueeze(0)).norm(dim=-1).mean().item()
-        print(f"  [Reach] Final EE distance to cup: {final_ee_dist:.3f}m")
+        final_ee_dist = (ee_world - env._arm_target_world).norm(dim=-1).mean().item()
+        cup_dist = (ee_world - cup_pos_all).norm(dim=-1).mean().item()
+        print(f"  [Reach] Final EE dist to target: {final_ee_dist:.3f}m (best: {best_ee_dist:.3f}m)")
+        print(f"  [Reach] Final EE dist to cup: {cup_dist:.3f}m")
     else:
         # --- HEURISTIC MODE ---
         print(f"\n{'-'*50}")
@@ -279,7 +332,8 @@ def main():
             break
 
         if use_arm_policy:
-            obs = env.step_arm_policy(stand_cmd)
+            # Arm already frozen at reached position, just hold
+            obs = env.step_manipulation(stand_cmd, hold_arm_targets)
         else:
             arm_targets = env.arm_controller.get_targets()
             obs = env.step_manipulation(stand_cmd, arm_targets)
@@ -309,7 +363,8 @@ def main():
             break
 
         if use_arm_policy:
-            obs = env.step_arm_policy(stand_cmd)
+            # Hold arm at reached position (already frozen)
+            obs = env.step_manipulation(stand_cmd, hold_arm_targets)
         else:
             arm_targets = env.arm_controller.get_targets()
             obs = env.step_manipulation(stand_cmd, arm_targets)

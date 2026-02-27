@@ -62,6 +62,12 @@ SHOULDER_OFFSET = [0.0, -0.174, 0.259]
 # Stage 7 curriculum level 7 thresholds
 OBS_POS_THRESHOLD = 0.04  # meters
 MAX_REACH_STEPS = 150
+
+# Joint limits from 23-DoF training robot (must clamp to prevent OOD)
+# Order: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll
+# Conservative limits (tighter than physical) to stay within training distribution
+ARM_JOINT_LOWER = [-1.50, -1.50, -1.80, -0.20, -1.50]
+ARM_JOINT_UPPER = [ 1.50,  1.00,  1.80,  2.50,  1.50]
 HEIGHT_DEFAULT = 0.72     # Stage 7 training height command
 
 # Joint name mapping: Stage 7 (23-DoF) -> 29-DoF
@@ -167,6 +173,14 @@ class ArmPolicyWrapper:
             ARM_DEFAULT, dtype=torch.float32, device=self.device
         )
 
+        # Joint limits from 23-DoF training robot
+        self._joint_lower = torch.tensor(
+            ARM_JOINT_LOWER, dtype=torch.float32, device=self.device
+        )
+        self._joint_upper = torch.tensor(
+            ARM_JOINT_UPPER, dtype=torch.float32, device=self.device
+        )
+
         # Print info
         ckpt_name = os.path.basename(checkpoint_path)
         curriculum = ckpt.get("curriculum_level", "?")
@@ -190,20 +204,36 @@ class ArmPolicyWrapper:
         """
         return self.net(obs)
 
-    def get_arm_targets(self, obs: torch.Tensor) -> torch.Tensor:
+    def get_arm_targets(self, obs: torch.Tensor, smooth_alpha: float = 0.3) -> torch.Tensor:
         """
         Get absolute joint targets from arm policy.
 
         Args:
             obs: [N, 55] arm observation
+            smooth_alpha: exponential smoothing factor (0=no smoothing, 1=full smoothing)
 
         Returns:
-            targets: [N, 5] absolute joint positions for the 5 policy-controlled joints
+            targets: [N, 5] absolute joint positions for the 5 policy-controlled joints,
+                     clamped to training joint limits and smoothed to prevent instability.
         """
         raw_action = self.get_action(obs)
         # target = default + action * scale  (matches Stage 7 training)
         targets = self._default_arm.unsqueeze(0) + raw_action * ARM_ACTION_SCALE
+        # Clamp to conservative joint limits
+        # Without this, the 29-DoF robot's wider limits allow the arm to
+        # enter out-of-distribution states, causing a positive feedback loop
+        # where the policy outputs increasingly extreme actions.
+        targets = torch.max(targets, self._joint_lower.unsqueeze(0))
+        targets = torch.min(targets, self._joint_upper.unsqueeze(0))
+        # Exponential smoothing: blend with previous targets to reduce jitter
+        if smooth_alpha > 0 and hasattr(self, '_prev_targets') and self._prev_targets is not None:
+            targets = (1.0 - smooth_alpha) * targets + smooth_alpha * self._prev_targets
+        self._prev_targets = targets.clone()
         return targets
+
+    def reset_state(self):
+        """Reset internal state (call when activating the arm policy)."""
+        self._prev_targets = None
 
     @staticmethod
     def build_obs(

@@ -492,7 +492,8 @@ class HierarchicalG1Env:
         self._ee_pos_at_spawn = torch.zeros(num_envs, 3, device=device)
         self._arm_steps_since_spawn = torch.zeros(num_envs, dtype=torch.long, device=device)
         self._arm_initial_dist = torch.zeros(num_envs, device=device)
-        self._arm_target_body = torch.zeros(num_envs, 3, device=device)
+        self._arm_target_world = torch.zeros(num_envs, 3, device=device)  # stored in WORLD frame
+        self._arm_target_body = torch.zeros(num_envs, 3, device=device)   # recomputed each step
         self._arm_target_orient = torch.zeros(num_envs, 3, device=device)
         self._arm_target_orient[:, 2] = -1.0  # palm down default
         # Finger limits (resolved after first reset)
@@ -583,19 +584,40 @@ class HierarchicalG1Env:
                 device=self.device
             )
 
-            # Palm body index (search for "palm" or "hand_base" in body names)
+            # Palm/EE body index
+            # 23-DoF robot: right_palm_link (child of elbow_roll_joint)
+            # 29-DoF DEX3:  right_wrist_pitch_link (child of wrist_roll_joint)
+            #   because wrist_roll = old elbow_roll, so the child link is the equivalent
+            #   of the old right_palm_link.
+            # Wrist_pitch and wrist_yaw joints are NOT controlled by the policy,
+            # so using wrist_pitch_link gives the most accurate EE position
+            # matching the 23-DoF training configuration.
+            # Search priority: right_palm > right_wrist_pitch > right_wrist_yaw > fallback
             body_names = self.robot.body_names
             self._palm_body_idx = None
-            for i, name in enumerate(body_names):
-                if "right_palm" in name.lower() or "right_hand_base" in name.lower():
-                    self._palm_body_idx = i
+            search_order = [
+                "right_hand_palm",      # DEX3 actual palm link
+                "right_palm",           # 23-DoF exact name
+                "right_wrist_pitch",    # 29-DoF equivalent (child of wrist_roll)
+                "right_wrist_yaw",      # fallback (end of wrist chain)
+                "right_hand_base",      # alternate naming
+            ]
+            for search_term in search_order:
+                for i, name in enumerate(body_names):
+                    if search_term in name.lower():
+                        self._palm_body_idx = i
+                        break
+                if self._palm_body_idx is not None:
                     break
             if self._palm_body_idx is None:
                 # Fallback: use last body (often the right hand tip)
                 self._palm_body_idx = len(body_names) - 1
-                print(f"  [WARN] No palm body found, using last body: {body_names[-1]}")
-            else:
-                print(f"  Palm body: {body_names[self._palm_body_idx]} (idx={self._palm_body_idx})")
+                print(f"  [WARN] No palm/wrist body found! Using last body: {body_names[-1]}")
+            # Always print all body names for debugging
+            print(f"  All bodies ({len(body_names)}): "
+                  f"{[n for n in body_names if 'right' in n.lower() and ('wrist' in n.lower() or 'palm' in n.lower() or 'hand' in n.lower())]}")
+            if self._palm_body_idx is not None:
+                print(f"  EE body: {body_names[self._palm_body_idx]} (idx={self._palm_body_idx})")
 
             print(f"  ArmPolicy joints (5): {[joint_names[i] for i in ap_idx]}")
             print(f"  Right fingers (7): {[joint_names[i] for i in rf_idx[:3]]}...")
@@ -648,6 +670,7 @@ class HierarchicalG1Env:
         self._ee_pos_at_spawn.zero_()
         self._arm_steps_since_spawn.zero_()
         self._arm_initial_dist.zero_()
+        self._arm_target_world.zero_()
         self._arm_target_body.zero_()
         self._arm_target_orient.zero_()
         self._arm_target_orient[:, 2] = -1.0
@@ -867,13 +890,16 @@ class HierarchicalG1Env:
     def set_arm_target_world(self, target_world: torch.Tensor):
         """
         Set arm reach target in world coordinates.
-        Converts to body frame internally.
+        The body-frame target is recomputed EACH STEP in _build_arm_obs()
+        since the robot moves and the body frame changes continuously.
 
         Args:
             target_world: [N, 3] or [3] target position in world frame
         """
         if target_world.ndim == 1:
             target_world = target_world.unsqueeze(0).expand(self.num_envs, -1)
+        self._arm_target_world = target_world.clone()
+        # Also compute initial body frame for reset_arm_policy_state
         root_pos = self.robot.data.root_pos_w
         root_quat = self.robot.data.root_quat_w
         self._arm_target_body = quat_apply_inverse(root_quat, target_world - root_pos)
@@ -905,12 +931,22 @@ class HierarchicalG1Env:
         """
         Build 55-dim observation for Stage 7 arm actor.
         Matches the training format exactly.
+
+        CRITICAL: Target body-frame position is recomputed each step from
+        the stored world-frame target, since the robot moves and the body
+        frame changes continuously.
         """
         from ..low_level.arm_policy_wrapper import ArmPolicyWrapper
 
         r = self.robot
         root_pos = r.data.root_pos_w
         root_quat = r.data.root_quat_w
+
+        # --- Recompute target in body frame each step ---
+        # This is essential: the robot walks/rotates, so body frame changes
+        self._arm_target_body = quat_apply_inverse(
+            root_quat, self._arm_target_world - root_pos
+        )
 
         # Right arm joint pos/vel (5 policy joints)
         arm_pos = r.data.joint_pos[:, self._arm_policy_joint_idx]
@@ -992,6 +1028,8 @@ class HierarchicalG1Env:
         """Reset arm policy state buffers (call when activating arm policy)."""
         if self.arm_policy is None:
             return
+        # Reset arm policy internal state (smoothing, etc.)
+        self.arm_policy.reset_state()
         # Compute current EE position
         ee_world, _ = self._compute_palm_ee()
         root_pos = self.robot.data.root_pos_w
