@@ -390,6 +390,7 @@ class HierarchicalG1Env:
         checkpoint_path: str,
         num_envs: int = 16,
         device: str = "cuda:0",
+        arm_checkpoint_path: Optional[str] = None,
     ):
         self.sim = sim
         self.device = device
@@ -426,12 +427,22 @@ class HierarchicalG1Env:
             device=device,
         )
 
-        # -- Create arm controller --
+        # -- Create arm controller (heuristic fallback) --
         from ..low_level.arm_controller import ArmController
         self.arm_controller = ArmController(
             num_envs=num_envs,
             device=device,
         )
+
+        # -- Optionally load Stage 7 arm policy --
+        self.arm_policy = None
+        self._arm_policy_enabled = False
+        if arm_checkpoint_path is not None:
+            from ..low_level.arm_policy_wrapper import ArmPolicyWrapper
+            self.arm_policy = ArmPolicyWrapper(
+                checkpoint_path=arm_checkpoint_path,
+                device=device,
+            )
 
         # Joint indices (set after first reset)
         self._loco_idx: Optional[torch.Tensor] = None
@@ -471,10 +482,29 @@ class HierarchicalG1Env:
         self._initial_pos: Optional[torch.Tensor] = None
         self._is_reset = False
 
+        # -- Stage 7 arm policy state (only used when arm_policy is loaded) --
+        # These are resolved in _resolve_joint_indices after first reset
+        self._arm_policy_joint_idx: Optional[torch.Tensor] = None  # 5 joints in robot
+        self._right_finger_idx: Optional[torch.Tensor] = None      # 7 right finger joints
+        self._palm_body_idx: Optional[int] = None                   # palm body index
+        # Arm policy state buffers
+        self._prev_ee_pos = torch.zeros(num_envs, 3, device=device)
+        self._ee_pos_at_spawn = torch.zeros(num_envs, 3, device=device)
+        self._arm_steps_since_spawn = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self._arm_initial_dist = torch.zeros(num_envs, device=device)
+        self._arm_target_body = torch.zeros(num_envs, 3, device=device)
+        self._arm_target_orient = torch.zeros(num_envs, 3, device=device)
+        self._arm_target_orient[:, 2] = -1.0  # palm down default
+        # Finger limits (resolved after first reset)
+        self._right_finger_lower: Optional[torch.Tensor] = None
+        self._right_finger_upper: Optional[torch.Tensor] = None
+
         print(f"[HierarchicalG1Env V6.2] {num_envs} envs, device={device}")
         print(f"[HierarchicalG1Env V6.2] Control: {1.0/self.control_dt:.0f} Hz "
               f"({self.decimation}x decimation)")
+        arm_mode = "Stage7 policy" if self.arm_policy is not None else "heuristic"
         print(f"[HierarchicalG1Env V6.2] Joints: 15 loco + 14 arm + 14 finger = 43")
+        print(f"[HierarchicalG1Env V6.2] Arm control: {arm_mode}")
 
     # --------------------------------------------------------------------- #
     # Joint index resolution
@@ -515,6 +545,60 @@ class HierarchicalG1Env:
         print(f"  Loco (15): {[joint_names[i] for i in loco_idx[:4]]}...")
         print(f"  Arm  (14): {[joint_names[i] for i in arm_idx[:4]]}...")
         print(f"  Hand (14): {[joint_names[i] for i in hand_idx[:4]]}...")
+
+        # -- Arm policy indices (Stage 7: right arm 5 joints + right fingers 7) --
+        if self.arm_policy is not None:
+            from ..low_level.arm_policy_wrapper import (
+                ARM_POLICY_JOINT_NAMES_29DOF,
+                RIGHT_FINGER_JOINT_NAMES_29DOF,
+            )
+            # 5 arm policy joints
+            ap_idx = []
+            for name in ARM_POLICY_JOINT_NAMES_29DOF:
+                if name not in joint_names:
+                    raise RuntimeError(f"Arm policy joint '{name}' not found!")
+                ap_idx.append(joint_names.index(name))
+            self._arm_policy_joint_idx = torch.tensor(
+                ap_idx, device=self.device, dtype=torch.long
+            )
+
+            # 7 right finger joints
+            rf_idx = []
+            for name in RIGHT_FINGER_JOINT_NAMES_29DOF:
+                if name not in joint_names:
+                    raise RuntimeError(f"Right finger joint '{name}' not found!")
+                rf_idx.append(joint_names.index(name))
+            self._right_finger_idx = torch.tensor(
+                rf_idx, device=self.device, dtype=torch.long
+            )
+
+            # Finger joint limits
+            joint_limits = self.robot.root_physx_view.get_dof_limits()
+            self._right_finger_lower = torch.tensor(
+                [joint_limits[0, i, 0].item() for i in rf_idx],
+                device=self.device
+            )
+            self._right_finger_upper = torch.tensor(
+                [joint_limits[0, i, 1].item() for i in rf_idx],
+                device=self.device
+            )
+
+            # Palm body index (search for "palm" or "hand_base" in body names)
+            body_names = self.robot.body_names
+            self._palm_body_idx = None
+            for i, name in enumerate(body_names):
+                if "right_palm" in name.lower() or "right_hand_base" in name.lower():
+                    self._palm_body_idx = i
+                    break
+            if self._palm_body_idx is None:
+                # Fallback: use last body (often the right hand tip)
+                self._palm_body_idx = len(body_names) - 1
+                print(f"  [WARN] No palm body found, using last body: {body_names[-1]}")
+            else:
+                print(f"  Palm body: {body_names[self._palm_body_idx]} (idx={self._palm_body_idx})")
+
+            print(f"  ArmPolicy joints (5): {[joint_names[i] for i in ap_idx]}")
+            print(f"  Right fingers (7): {[joint_names[i] for i in rf_idx[:3]]}...")
 
     # --------------------------------------------------------------------- #
     # Public API
@@ -557,6 +641,16 @@ class HierarchicalG1Env:
         self.arm_controller.reset()
         self.step_count = 0
         self._manipulation_mode = False
+        self._arm_policy_enabled = False
+
+        # Reset arm policy state
+        self._prev_ee_pos.zero_()
+        self._ee_pos_at_spawn.zero_()
+        self._arm_steps_since_spawn.zero_()
+        self._arm_initial_dist.zero_()
+        self._arm_target_body.zero_()
+        self._arm_target_orient.zero_()
+        self._arm_target_orient[:, 2] = -1.0
 
         # Store initial XY positions
         self._initial_pos = self.robot.data.root_pos_w[:, :2].clone()
@@ -757,6 +851,197 @@ class HierarchicalG1Env:
         tgt[:, self._hand_idx] = finger_targets
 
         self.robot.set_joint_position_target(tgt)
+
+    # --------------------------------------------------------------------- #
+    # Stage 7 Arm Policy support
+    # --------------------------------------------------------------------- #
+    def enable_arm_policy(self, enabled: bool = True):
+        """Enable/disable Stage 7 arm policy for right arm."""
+        if enabled and self.arm_policy is None:
+            print("[HierarchicalG1Env] WARNING: No arm policy loaded, staying in heuristic mode")
+            return
+        self._arm_policy_enabled = enabled
+        mode = "Stage7 policy" if enabled else "heuristic"
+        print(f"[HierarchicalG1Env] Arm control: {mode}")
+
+    def set_arm_target_world(self, target_world: torch.Tensor):
+        """
+        Set arm reach target in world coordinates.
+        Converts to body frame internally.
+
+        Args:
+            target_world: [N, 3] or [3] target position in world frame
+        """
+        if target_world.ndim == 1:
+            target_world = target_world.unsqueeze(0).expand(self.num_envs, -1)
+        root_pos = self.robot.data.root_pos_w
+        root_quat = self.robot.data.root_quat_w
+        self._arm_target_body = quat_apply_inverse(root_quat, target_world - root_pos)
+
+    def set_arm_target_body(self, target_body: torch.Tensor):
+        """
+        Set arm reach target directly in body frame.
+
+        Args:
+            target_body: [N, 3] or [3] target in body frame
+        """
+        if target_body.ndim == 1:
+            target_body = target_body.unsqueeze(0).expand(self.num_envs, -1)
+        self._arm_target_body = target_body.clone()
+
+    def _compute_palm_ee(self):
+        """
+        Compute end-effector position from palm body.
+        Returns ee_world [N,3] and palm_quat [N,4] (wxyz).
+        """
+        from ..low_level.arm_policy_wrapper import get_palm_forward, PALM_FORWARD_OFFSET
+        palm_pos = self.robot.data.body_pos_w[:, self._palm_body_idx]
+        palm_quat = self.robot.data.body_quat_w[:, self._palm_body_idx]
+        palm_fwd = get_palm_forward(palm_quat)
+        ee_pos = palm_pos + PALM_FORWARD_OFFSET * palm_fwd
+        return ee_pos, palm_quat
+
+    def _build_arm_obs(self) -> torch.Tensor:
+        """
+        Build 55-dim observation for Stage 7 arm actor.
+        Matches the training format exactly.
+        """
+        from ..low_level.arm_policy_wrapper import ArmPolicyWrapper
+
+        r = self.robot
+        root_pos = r.data.root_pos_w
+        root_quat = r.data.root_quat_w
+
+        # Right arm joint pos/vel (5 policy joints)
+        arm_pos = r.data.joint_pos[:, self._arm_policy_joint_idx]
+        arm_vel = r.data.joint_vel[:, self._arm_policy_joint_idx]
+
+        # Right finger positions (7 joints)
+        finger_pos = r.data.joint_pos[:, self._right_finger_idx]
+
+        # EE computation
+        ee_world, palm_quat = self._compute_palm_ee()
+        ee_body = quat_apply_inverse(root_quat, ee_world - root_pos)
+        ee_vel_world = (ee_world - self._prev_ee_pos) / CONTROL_DT
+        ee_vel_body = quat_apply_inverse(root_quat, ee_vel_world)
+
+        # Body-frame velocities
+        lin_vel_b = quat_apply_inverse(root_quat, r.data.root_lin_vel_w)
+        ang_vel_b = quat_apply_inverse(root_quat, r.data.root_ang_vel_w)
+
+        obs = ArmPolicyWrapper.build_obs(
+            arm_pos=arm_pos,
+            arm_vel=arm_vel,
+            finger_pos=finger_pos,
+            ee_body=ee_body,
+            ee_vel_body=ee_vel_body,
+            palm_quat=palm_quat,
+            finger_lower=self._right_finger_lower,
+            finger_upper=self._right_finger_upper,
+            target_body=self._arm_target_body,
+            root_height=root_pos[:, 2],
+            lin_vel_body=lin_vel_b,
+            ang_vel_body=ang_vel_b,
+            steps_since_spawn=self._arm_steps_since_spawn,
+            ee_pos_at_spawn=self._ee_pos_at_spawn,
+            initial_dist=self._arm_initial_dist,
+            target_orient=self._arm_target_orient,
+        )
+
+        # Update EE history for velocity computation
+        self._prev_ee_pos = ee_world.clone()
+        # Increment arm step counter
+        self._arm_steps_since_spawn += 1
+
+        return obs
+
+    def _get_arm_policy_targets(self) -> torch.Tensor:
+        """
+        Run Stage 7 arm policy and return full 14-dim arm targets.
+
+        The policy outputs 5 joints (right arm). The remaining 9 joints
+        (left arm 7 + right wrist_pitch + right wrist_yaw) use heuristic defaults.
+
+        Returns:
+            arm_targets: [N, 14] in ARM_JOINT_NAMES order
+        """
+        # Build obs and run policy
+        obs = self._build_arm_obs()
+        right_5_targets = self.arm_policy.get_arm_targets(obs)  # [N, 5]
+
+        # Start with default arm pose (14 joints: left 7 + right 7)
+        arm_targets = self._default_arm.unsqueeze(0).expand(self.num_envs, -1).clone()
+
+        # Map 5 policy outputs to the correct positions in the 14-dim ARM_JOINT_NAMES
+        # ARM_JOINT_NAMES order: L_sp, L_sr, L_sy, L_e, L_wr, L_wp, L_wy,
+        #                        R_sp, R_sr, R_sy, R_e, R_wr, R_wp, R_wy
+        # Policy outputs:  R_sp(0), R_sr(1), R_sy(2), R_e(3), R_wr(4)
+        # -> indices 7, 8, 9, 10, 11 in ARM_JOINT_NAMES
+        arm_targets[:, 7] = right_5_targets[:, 0]   # right_shoulder_pitch
+        arm_targets[:, 8] = right_5_targets[:, 1]   # right_shoulder_roll
+        arm_targets[:, 9] = right_5_targets[:, 2]   # right_shoulder_yaw
+        arm_targets[:, 10] = right_5_targets[:, 3]  # right_elbow
+        arm_targets[:, 11] = right_5_targets[:, 4]  # right_wrist_roll
+
+        # Right wrist_pitch and wrist_yaw stay at default (indices 12, 13)
+        # Left arm stays at default (indices 0-6)
+
+        return arm_targets
+
+    def reset_arm_policy_state(self):
+        """Reset arm policy state buffers (call when activating arm policy)."""
+        if self.arm_policy is None:
+            return
+        # Compute current EE position
+        ee_world, _ = self._compute_palm_ee()
+        root_pos = self.robot.data.root_pos_w
+        root_quat = self.robot.data.root_quat_w
+        ee_body = quat_apply_inverse(root_quat, ee_world - root_pos)
+
+        self._prev_ee_pos = ee_world.clone()
+        self._ee_pos_at_spawn = ee_body.clone()
+        self._arm_steps_since_spawn.zero_()
+        # Initial distance to target
+        self._arm_initial_dist = (
+            self._arm_target_body - ee_body
+        ).norm(dim=-1).clamp(min=0.01)
+        print(f"[ArmPolicy] Reset state, initial dist: {self._arm_initial_dist.mean():.3f}m")
+
+    def step_arm_policy(self, velocity_command: torch.Tensor) -> dict:
+        """
+        Step in MANIPULATION mode using Stage 7 arm policy for right arm.
+
+        Loco policy controls legs+waist (15).
+        Arm policy controls right arm (5 joints).
+        Left arm + wrist heuristic (9 joints).
+        Fingers from controller (14).
+
+        Args:
+            velocity_command: [N, 3] velocity for leg balance
+
+        Returns:
+            obs_dict
+        """
+        # Loco actions
+        loco_targets = self._run_loco_policy(velocity_command)
+
+        # Arm targets from Stage 7 policy
+        arm_targets = self._get_arm_policy_targets()
+
+        # Finger targets
+        finger_targets = self.finger_controller.get_targets()
+
+        # Apply all targets
+        self._apply_targets(loco_targets, arm_targets, finger_targets)
+
+        # Physics sub-stepping
+        for _ in range(self.decimation):
+            self.scene.write_data_to_sim()
+            self.sim.step()
+
+        self.scene.update(self.control_dt)
+        self.step_count += 1
+        return self.get_obs()
 
     # --------------------------------------------------------------------- #
     # Observations

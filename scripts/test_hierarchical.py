@@ -34,6 +34,10 @@ parser.add_argument(
     "--checkpoint", type=str, required=True,
     help="Path to trained V6.2 loco policy checkpoint (.pt file)",
 )
+parser.add_argument(
+    "--arm_checkpoint", type=str, default=None,
+    help="Path to Stage 7 arm policy checkpoint (.pt file). If provided, uses learned arm control.",
+)
 parser.add_argument("--walk_distance", type=float, default=3.0, help="Walk distance in meters")
 parser.add_argument("--max_steps", type=int, default=2000, help="Maximum walk steps before timeout")
 AppLauncher.add_app_launcher_args(parser)
@@ -101,7 +105,12 @@ def main():
     print(f"  Environments : {num_envs}")
     print(f"  Checkpoint   : {args_cli.checkpoint}")
     print(f"  Walk distance: {args_cli.walk_distance}m")
+    use_arm_policy = args_cli.arm_checkpoint is not None
+    arm_mode_str = "Stage7 arm policy" if use_arm_policy else "heuristic"
     print(f"  Loco policy  : V6.2 (66 obs -> 15 act, LN+ELU)")
+    print(f"  Arm control  : {arm_mode_str}")
+    if use_arm_policy:
+        print(f"  Arm ckpt     : {args_cli.arm_checkpoint}")
     print("=" * 60)
 
     # ------------------------------------------------------------------
@@ -133,6 +142,7 @@ def main():
         checkpoint_path=args_cli.checkpoint,
         num_envs=num_envs,
         device=device,
+        arm_checkpoint_path=args_cli.arm_checkpoint,
     )
 
     # ------------------------------------------------------------------
@@ -196,28 +206,64 @@ def main():
     # ==================================================================
     # PHASE 3: Reach forward (manipulation mode)
     # ==================================================================
-    print(f"\n{'-'*50}")
-    print(f"  PHASE 3: Reach forward (V6.2 -- no arm conflict)")
-    print(f"{'-'*50}")
+    if use_arm_policy:
+        # --- ARM POLICY MODE ---
+        print(f"\n{'-'*50}")
+        print(f"  PHASE 3: Reach with Stage 7 arm policy (right arm)")
+        print(f"{'-'*50}")
 
-    env.set_manipulation_mode(True)
-    env.arm_controller.set_pose(ArmPose.REACH_FORWARD)
+        env.set_manipulation_mode(True)
+        env.enable_arm_policy(True)
 
-    for step in range(200):
-        if not simulation_app.is_running():
-            break
+        # Set target to cup position (or table center if no cup)
+        cup_pos = env.cup.data.root_pos_w.mean(dim=0)  # [3]
+        print(f"  Target (cup): [{cup_pos[0]:.2f}, {cup_pos[1]:.2f}, {cup_pos[2]:.2f}]")
+        env.set_arm_target_world(cup_pos.unsqueeze(0).expand(num_envs, -1))
+        env.reset_arm_policy_state()
 
-        arm_targets = env.arm_controller.get_targets()
-        obs = env.step_manipulation(stand_cmd, arm_targets)
+        for step in range(300):
+            if not simulation_app.is_running():
+                break
 
-        if step % 50 == 0:
-            h = obs["base_height"].mean().item()
-            arm_done = env.arm_controller.is_done
-            standing = (obs["base_height"] > 0.5).sum().item()
-            print(f"  [Reach] Step {step:4d} | Height: {h:.2f}m | "
-                  f"Standing: {standing}/{num_envs} | Arm done: {arm_done}")
+            obs = env.step_arm_policy(stand_cmd)
 
-    print(f"  [Reach] Arms in REACH_FORWARD position")
+            if step % 50 == 0:
+                h = obs["base_height"].mean().item()
+                standing = (obs["base_height"] > 0.5).sum().item()
+                # Show EE distance to target
+                ee_world, _ = env._compute_palm_ee()
+                ee_dist = (ee_world - cup_pos.unsqueeze(0)).norm(dim=-1).mean().item()
+                print(f"  [Reach] Step {step:4d} | Height: {h:.2f}m | "
+                      f"Standing: {standing}/{num_envs} | EE dist: {ee_dist:.3f}m")
+
+        # Final EE distance
+        ee_world, _ = env._compute_palm_ee()
+        final_ee_dist = (ee_world - cup_pos.unsqueeze(0)).norm(dim=-1).mean().item()
+        print(f"  [Reach] Final EE distance to cup: {final_ee_dist:.3f}m")
+    else:
+        # --- HEURISTIC MODE ---
+        print(f"\n{'-'*50}")
+        print(f"  PHASE 3: Reach forward (heuristic -- no arm conflict)")
+        print(f"{'-'*50}")
+
+        env.set_manipulation_mode(True)
+        env.arm_controller.set_pose(ArmPose.REACH_FORWARD)
+
+        for step in range(200):
+            if not simulation_app.is_running():
+                break
+
+            arm_targets = env.arm_controller.get_targets()
+            obs = env.step_manipulation(stand_cmd, arm_targets)
+
+            if step % 50 == 0:
+                h = obs["base_height"].mean().item()
+                arm_done = env.arm_controller.is_done
+                standing = (obs["base_height"] > 0.5).sum().item()
+                print(f"  [Reach] Step {step:4d} | Height: {h:.2f}m | "
+                      f"Standing: {standing}/{num_envs} | Arm done: {arm_done}")
+
+        print(f"  [Reach] Arms in REACH_FORWARD position")
 
     # ==================================================================
     # PHASE 4: Close fingers (grasp)
@@ -232,8 +278,11 @@ def main():
         if not simulation_app.is_running():
             break
 
-        arm_targets = env.arm_controller.get_targets()
-        obs = env.step_manipulation(stand_cmd, arm_targets)
+        if use_arm_policy:
+            obs = env.step_arm_policy(stand_cmd)
+        else:
+            arm_targets = env.arm_controller.get_targets()
+            obs = env.step_manipulation(stand_cmd, arm_targets)
 
         if step % 25 == 0:
             finger_pos = obs["joint_pos_finger"]
@@ -246,27 +295,30 @@ def main():
     print(f"  [Grasp] Fingers closed!")
 
     # ==================================================================
-    # PHASE 5: Move to carry pose (arms bent, holding object)
+    # PHASE 5: Carry / hold (arm policy keeps reaching, or heuristic carry)
     # ==================================================================
     print(f"\n{'-'*50}")
     print(f"  PHASE 5: Carry pose")
     print(f"{'-'*50}")
 
-    env.arm_controller.set_pose(ArmPose.CARRY)
+    if not use_arm_policy:
+        env.arm_controller.set_pose(ArmPose.CARRY)
 
     for step in range(200):
         if not simulation_app.is_running():
             break
 
-        arm_targets = env.arm_controller.get_targets()
-        obs = env.step_manipulation(stand_cmd, arm_targets)
+        if use_arm_policy:
+            obs = env.step_arm_policy(stand_cmd)
+        else:
+            arm_targets = env.arm_controller.get_targets()
+            obs = env.step_manipulation(stand_cmd, arm_targets)
 
         if step % 50 == 0:
             h = obs["base_height"].mean().item()
-            arm_done = env.arm_controller.is_done
             standing = (obs["base_height"] > 0.5).sum().item()
             print(f"  [Carry] Step {step:4d} | Height: {h:.2f}m | "
-                  f"Standing: {standing}/{num_envs} | Arm done: {arm_done}")
+                  f"Standing: {standing}/{num_envs}")
 
     # ==================================================================
     # PHASE 6: Return to default pose, open fingers
@@ -275,6 +327,8 @@ def main():
     print(f"  PHASE 6: Return to default + open fingers")
     print(f"{'-'*50}")
 
+    # Switch back to heuristic for return
+    env.enable_arm_policy(False)
     env.arm_controller.set_pose(ArmPose.DEFAULT)
     env.finger_controller.open(hand="both")
 
@@ -301,16 +355,20 @@ def main():
     distances = torch.norm(final_pos - target_positions, dim=-1)
 
     print("\n" + "=" * 60)
-    print("  DEMO RESULTS (V6.2 Loco)")
+    print(f"  DEMO RESULTS (V6.2 Loco + {arm_mode_str})")
     print("=" * 60)
     print(f"  Walk          : {result.status.name} ({walk_time:.1f}s)")
-    print(f"  Reach         : OK (arms extended forward)")
+    if use_arm_policy:
+        print(f"  Reach         : Stage7 arm policy (EE dist: {final_ee_dist:.3f}m)")
+    else:
+        print(f"  Reach         : OK (heuristic arms extended)")
     print(f"  Grasp         : OK (fingers closed)")
-    print(f"  Carry         : OK (arms in carry pose)")
+    print(f"  Carry         : OK")
     print(f"  Return        : OK (arms back to default)")
     print(f"  Final height  : {obs['base_height'].mean():.2f}m")
     print(f"  Standing      : {(obs['base_height'] > 0.5).sum()}/{num_envs}")
     print(f"  Loco policy   : V6.2 (66->15, legs+waist only)")
+    print(f"  Arm control   : {arm_mode_str}")
     print(f"  Total DoF     : 43 (15 loco + 14 arm + 14 finger)")
     print("=" * 60)
 
