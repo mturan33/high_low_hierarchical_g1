@@ -1,8 +1,15 @@
 """
-Hierarchical G1 Environment (DEX3)
-====================================
+Hierarchical G1 Environment (V6.2 Loco + DEX3)
+=================================================
 Isaac Lab environment for hierarchical control of the G1 humanoid
-with DEX3 3-finger hands (43 DoF = 29 body + 14 fingers).
+with DEX3 3-finger hands (43 DoF = 15 loco + 14 arm + 14 finger).
+
+Key change from previous version:
+  - Uses V6.2 unified locomotion policy (66 obs → 15 act)
+  - Loco policy controls ONLY legs + waist (15 joints)
+  - Arms controlled separately by ArmController (14 joints)
+  - Fingers controlled by FingerController (14 joints)
+  - No more "overriding" — loco never touches arms!
 
 Scene:
   - G1 robot with DEX3 hands on flat terrain
@@ -12,32 +19,24 @@ Scene:
 
 Control pipeline (walking mode):
   velocity_command [vx, vy, vyaw]
-      -> LocomotionPolicy (pre-trained, 480->29 body joints)
-      -> FingerController (heuristic open/close, 14 finger joints)
-          -> Robot PD actuators (43 total)
+      → V6.2 LocoPolicy (66 obs → 15 loco actions)
+      → legs+waist targets (15) + arm defaults (14) + finger targets (14)
+      → Robot PD actuators (43 total)
 
 Control pipeline (manipulation mode):
-  arm_targets [14 arm joints] (from IK/heuristic)
-      + LocomotionPolicy controls legs+waist only (15 joints)
-      + FingerController (14 finger joints)
-          -> Robot PD actuators (43 total)
+  velocity_command [vx, vy, vyaw]
+      → V6.2 LocoPolicy (66 obs → 15 loco actions)
+      → legs+waist targets (15) + arm_controller targets (14) + finger targets (14)
+      → Robot PD actuators (43 total)
 
-Usage:
-    env = HierarchicalG1Env(sim, HierarchicalSceneCfg(), checkpoint_path, num_envs=16)
-    obs = env.reset()
-
-    # Walking mode (loco policy controls everything including arms):
-    obs = env.step(vel_cmd)
-
-    # Manipulation mode (override arm joints, close fingers):
-    env.set_manipulation_mode(True)
-    env.finger_controller.close(hand="right")
-    obs = env.step_manipulation(vel_cmd, arm_targets)
+V6.2 actuator parameters are matched EXACTLY to training config.
 """
 
 from __future__ import annotations
 
+import math
 import torch
+import numpy as np
 from typing import Optional
 
 import isaaclab.sim as sim_utils
@@ -48,43 +47,270 @@ from isaaclab.assets import (
     RigidObject,
     RigidObjectCfg,
 )
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.math import quat_apply_inverse
 
-from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_DEX3_CFG
 
-from ..config.joint_config import NUM_ALL_JOINTS, NUM_DEX3_JOINTS
+# =============================================================================
+# V6.2 CONSTANTS — must match training exactly
+# =============================================================================
 
-# Physics / control constants (must match training config)
-PHYSICS_DT = 0.005       # 200 Hz physics
-DECIMATION = 4            # 4 physics steps per control step
+PHYSICS_DT = 1.0 / 200.0   # 200 Hz physics
+DECIMATION = 4               # 4 physics steps per control step
 CONTROL_DT = PHYSICS_DT * DECIMATION  # 0.02s = 50 Hz
 
+HEIGHT_DEFAULT = 0.80
+GAIT_FREQUENCY = 1.5  # Hz
 
-# ---------------------------------------------------------------------------
-# Scene Configuration
-# ---------------------------------------------------------------------------
+LEG_ACTION_SCALE = 0.4   # radians
+WAIST_ACTION_SCALE = 0.2  # radians
+
+# DEX3 USD path — SAME as V6.2 training (from unitree_sim_isaaclab)
+DEX3_USD_PATH = "C:/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/unitree_sim_isaaclab/assets/robots/g1-29dof_wholebody_dex3/g1_29dof_with_dex3_rev_1_0.usd"
+
+# Joint names — ordered by control group
+LOCO_JOINT_NAMES = [
+    "left_hip_pitch_joint", "right_hip_pitch_joint",
+    "left_hip_roll_joint", "right_hip_roll_joint",
+    "left_hip_yaw_joint", "right_hip_yaw_joint",
+    "left_knee_joint", "right_knee_joint",
+    "left_ankle_pitch_joint", "right_ankle_pitch_joint",
+    "left_ankle_roll_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+]  # 15
+
+ARM_JOINT_NAMES = [
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint",
+    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint",
+    "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]  # 14
+
+HAND_JOINT_NAMES = [
+    "left_hand_index_0_joint", "left_hand_middle_0_joint",
+    "left_hand_thumb_0_joint", "left_hand_index_1_joint",
+    "left_hand_middle_1_joint", "left_hand_thumb_1_joint",
+    "left_hand_thumb_2_joint",
+    "right_hand_index_0_joint", "right_hand_middle_0_joint",
+    "right_hand_thumb_0_joint", "right_hand_index_1_joint",
+    "right_hand_middle_1_joint", "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
+]  # 14
+
+# Default poses (V6.2 training init_state)
+DEFAULT_LOCO_POSES = {
+    "left_hip_pitch_joint": -0.20, "right_hip_pitch_joint": -0.20,
+    "left_hip_roll_joint": 0.0, "right_hip_roll_joint": 0.0,
+    "left_hip_yaw_joint": 0.0, "right_hip_yaw_joint": 0.0,
+    "left_knee_joint": 0.42, "right_knee_joint": 0.42,
+    "left_ankle_pitch_joint": -0.23, "right_ankle_pitch_joint": -0.23,
+    "left_ankle_roll_joint": 0.0, "right_ankle_roll_joint": 0.0,
+    "waist_yaw_joint": 0.0, "waist_roll_joint": 0.0, "waist_pitch_joint": 0.0,
+}
+DEFAULT_ARM_POSES = {
+    "left_shoulder_pitch_joint": 0.35, "left_shoulder_roll_joint": 0.18,
+    "left_shoulder_yaw_joint": 0.0, "left_elbow_joint": 0.87,
+    "left_wrist_roll_joint": 0.0, "left_wrist_pitch_joint": 0.0,
+    "left_wrist_yaw_joint": 0.0,
+    "right_shoulder_pitch_joint": 0.35, "right_shoulder_roll_joint": -0.18,
+    "right_shoulder_yaw_joint": 0.0, "right_elbow_joint": 0.87,
+    "right_wrist_roll_joint": 0.0, "right_wrist_pitch_joint": 0.0,
+    "right_wrist_yaw_joint": 0.0,
+}
+DEFAULT_HAND_POSES = {name: 0.0 for name in HAND_JOINT_NAMES}
+DEFAULT_ALL_POSES = {**DEFAULT_LOCO_POSES, **DEFAULT_ARM_POSES, **DEFAULT_HAND_POSES}
+
+# Default poses as ordered lists
+DEFAULT_LOCO_LIST = [DEFAULT_LOCO_POSES[j] for j in LOCO_JOINT_NAMES]
+DEFAULT_ARM_LIST = [DEFAULT_ARM_POSES[j] for j in ARM_JOINT_NAMES]
+DEFAULT_HAND_LIST = [DEFAULT_HAND_POSES[j] for j in HAND_JOINT_NAMES]
+
+
+def quat_to_euler_xyz_wxyz(quat: torch.Tensor) -> torch.Tensor:
+    """Convert wxyz quaternion (Isaac Lab convention) to roll, pitch, yaw.
+    Must match V6.2 training exactly."""
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr_cosp, cosr_cosp)
+    sinp = torch.clamp(2.0 * (w * y - z * x), -1.0, 1.0)
+    pitch = torch.asin(sinp)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny_cosp, cosy_cosp)
+    return torch.stack([roll, pitch, yaw], dim=-1)
+
+
+# =============================================================================
+# Scene Configuration — V6.2 actuator params exactly matching training
+# =============================================================================
+
 @configclass
 class HierarchicalSceneCfg(InteractiveSceneCfg):
-    """Scene: flat ground + G1-DEX3 robot + table + cup + light."""
+    """Scene: flat ground + G1-DEX3 robot + table + cup + light.
+    Robot actuator parameters match V6.2 training config EXACTLY."""
 
-    # -- Ground plane with high friction (matching training) --
-    ground = AssetBaseCfg(
+    # -- Terrain --
+    terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(
-            size=(100.0, 100.0),
-            physics_material=sim_utils.RigidBodyMaterialCfg(
-                static_friction=1.0,
-                dynamic_friction=1.0,
-                restitution=0.0,
-            ),
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.0, dynamic_friction=1.0, restitution=0.0,
         ),
     )
 
     # -- G1 Robot with DEX3 hands (43 DoF) --
-    robot: ArticulationCfg = UNITREE_G1_29DOF_DEX3_CFG.replace(
+    # Actuator params from ulc_g1_29dof_cfg.py ACTUATOR_PARAMS
+    robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=DEX3_USD_PATH,
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+                retain_accelerations=True,
+                linear_damping=0.0,
+                angular_damping=0.0,
+                max_linear_velocity=1000.0,
+                max_angular_velocity=1000.0,
+                max_depenetration_velocity=1.0,
+            ),
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=True,
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=1,
+            ),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 0.80),
+            joint_pos=DEFAULT_ALL_POSES,
+            joint_vel={".*": 0.0},
+        ),
+        soft_joint_pos_limit_factor=0.90,
+        actuators={
+            # Legs + waist: high stiffness for stability
+            "legs": ImplicitActuatorCfg(
+                joint_names_expr=[
+                    ".*_hip_yaw_joint", ".*_hip_roll_joint",
+                    ".*_hip_pitch_joint", ".*_knee_joint", ".*waist.*",
+                ],
+                effort_limit_sim={
+                    ".*_hip_yaw_joint": 88.0,
+                    ".*_hip_roll_joint": 139.0,
+                    ".*_hip_pitch_joint": 88.0,
+                    ".*_knee_joint": 139.0,
+                    ".*waist_yaw_joint": 88.0,
+                    ".*waist_roll_joint": 88.0,
+                    ".*waist_pitch_joint": 88.0,
+                },
+                velocity_limit_sim={
+                    ".*_hip_yaw_joint": 32.0,
+                    ".*_hip_roll_joint": 20.0,
+                    ".*_hip_pitch_joint": 32.0,
+                    ".*_knee_joint": 20.0,
+                    ".*waist_yaw_joint": 32.0,
+                    ".*waist_roll_joint": 30.0,
+                    ".*waist_pitch_joint": 30.0,
+                },
+                stiffness={
+                    ".*_hip_yaw_joint": 150.0,
+                    ".*_hip_roll_joint": 150.0,
+                    ".*_hip_pitch_joint": 200.0,
+                    ".*_knee_joint": 200.0,
+                    ".*waist.*": 200.0,
+                },
+                damping={
+                    ".*_hip_yaw_joint": 5.0,
+                    ".*_hip_roll_joint": 5.0,
+                    ".*_hip_pitch_joint": 5.0,
+                    ".*_knee_joint": 5.0,
+                    ".*waist.*": 10.0,
+                },
+                armature=0.01,
+            ),
+            # Feet: lower stiffness for compliance
+            "feet": ImplicitActuatorCfg(
+                joint_names_expr=[".*_ankle_pitch_joint", ".*_ankle_roll_joint"],
+                effort_limit_sim={
+                    ".*_ankle_pitch_joint": 35.0,
+                    ".*_ankle_roll_joint": 35.0,
+                },
+                velocity_limit_sim={
+                    ".*_ankle_pitch_joint": 30.0,
+                    ".*_ankle_roll_joint": 30.0,
+                },
+                stiffness=20.0,
+                damping=2.0,
+                armature=0.01,
+            ),
+            # Shoulders
+            "shoulders": ImplicitActuatorCfg(
+                joint_names_expr=[".*_shoulder_pitch_joint", ".*_shoulder_roll_joint"],
+                effort_limit_sim={
+                    ".*_shoulder_pitch_joint": 25.0,
+                    ".*_shoulder_roll_joint": 25.0,
+                },
+                velocity_limit_sim={
+                    ".*_shoulder_pitch_joint": 37.0,
+                    ".*_shoulder_roll_joint": 37.0,
+                },
+                stiffness=100.0,
+                damping=2.0,
+                armature=0.01,
+            ),
+            # Arms (shoulder_yaw + elbow)
+            "arms": ImplicitActuatorCfg(
+                joint_names_expr=[".*_shoulder_yaw_joint", ".*_elbow_joint"],
+                effort_limit_sim={
+                    ".*_shoulder_yaw_joint": 25.0,
+                    ".*_elbow_joint": 25.0,
+                },
+                velocity_limit_sim={
+                    ".*_shoulder_yaw_joint": 37.0,
+                    ".*_elbow_joint": 37.0,
+                },
+                stiffness=50.0,
+                damping=2.0,
+                armature=0.01,
+            ),
+            # Wrists
+            "wrist": ImplicitActuatorCfg(
+                joint_names_expr=[".*_wrist_.*"],
+                effort_limit_sim={
+                    ".*_wrist_yaw_joint": 5.0,
+                    ".*_wrist_roll_joint": 25.0,
+                    ".*_wrist_pitch_joint": 5.0,
+                },
+                velocity_limit_sim={
+                    ".*_wrist_yaw_joint": 22.0,
+                    ".*_wrist_roll_joint": 37.0,
+                    ".*_wrist_pitch_joint": 22.0,
+                },
+                stiffness=40.0,
+                damping=2.0,
+                armature=0.01,
+            ),
+            # DEX3 Hands
+            "hands": ImplicitActuatorCfg(
+                joint_names_expr=[
+                    ".*_hand_index_.*_joint",
+                    ".*_hand_middle_.*_joint",
+                    ".*_hand_thumb_.*_joint",
+                ],
+                effort_limit=300,
+                velocity_limit=100.0,
+                stiffness={".*": 100.0},
+                damping={".*": 10.0},
+                armature={".*": 0.1},
+            ),
+        },
     )
 
     # -- Table: 3.5 m ahead of robot spawn --
@@ -131,19 +357,30 @@ class HierarchicalSceneCfg(InteractiveSceneCfg):
     )
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Environment Wrapper
-# ---------------------------------------------------------------------------
+# =============================================================================
+
 class HierarchicalG1Env:
     """
-    Wraps an Isaac Lab InteractiveScene with a pre-trained locomotion
-    policy and DEX3 finger controller for hierarchical skill-based
-    control of the G1 humanoid.
+    V6.2 loco + DEX3 hierarchical control environment.
 
-    Two operating modes:
-      1. Walking mode: loco policy controls all 29 body joints, fingers idle
-      2. Manipulation mode: loco policy controls legs+waist (15),
-         arm targets provided externally (14), fingers from controller (14)
+    Loco policy controls legs + waist (15 joints).
+    Arms controlled by ArmController (14 joints).
+    Fingers controlled by FingerController (14 joints).
+    Total: 43 joints.
+
+    Walking mode:
+        env.step(vel_cmd)
+        → loco policy → legs+waist targets
+        → arms held at default
+        → fingers from controller
+
+    Manipulation mode:
+        env.step_manipulation(vel_cmd, arm_targets)
+        → loco policy → legs+waist targets
+        → arms from arm_targets
+        → fingers from controller
     """
 
     def __init__(
@@ -175,95 +412,109 @@ class HierarchicalG1Env:
         self.table: RigidObject = self.scene["table"]
         self.cup: RigidObject = self.scene["cup"]
 
-        # -- Load locomotion policy (29 body joints) --
+        # -- Load V6.2 locomotion policy --
         from ..low_level.policy_wrapper import LocomotionPolicy
-
         self.loco_policy = LocomotionPolicy(
             checkpoint_path=checkpoint_path,
             device=device,
-            num_envs=num_envs,
         )
 
-        # -- Create finger controller (14 DEX3 joints) --
+        # -- Create finger controller --
         from ..low_level.finger_controller import FingerController
-
         self.finger_controller = FingerController(
             num_envs=num_envs,
             device=device,
         )
 
-        # -- Create arm controller (14 arm joints, pose-based) --
+        # -- Create arm controller --
         from ..low_level.arm_controller import ArmController
-
         self.arm_controller = ArmController(
             num_envs=num_envs,
             device=device,
         )
 
-        # Joint index mappings (set after first reset when articulation is ready)
-        self._body_joint_ids: Optional[torch.Tensor] = None
-        self._finger_joint_ids: Optional[torch.Tensor] = None
-        self._arm_joint_ids: Optional[torch.Tensor] = None
-        self._leg_waist_joint_ids: Optional[torch.Tensor] = None
-        self._arm_local_indices: Optional[torch.Tensor] = None
+        # Joint indices (set after first reset)
+        self._loco_idx: Optional[torch.Tensor] = None
+        self._arm_idx: Optional[torch.Tensor] = None
+        self._hand_idx: Optional[torch.Tensor] = None
+        self._indices_resolved = False
 
-        # Placeholder for initial positions (set in reset)
+        # V6.2 state tracking
+        self._default_loco = torch.tensor(
+            DEFAULT_LOCO_LIST, dtype=torch.float32, device=device
+        )
+        self._default_arm = torch.tensor(
+            DEFAULT_ARM_LIST, dtype=torch.float32, device=device
+        )
+        self._default_hand = torch.tensor(
+            DEFAULT_HAND_LIST, dtype=torch.float32, device=device
+        )
+
+        leg_scales = [LEG_ACTION_SCALE] * 12
+        waist_scales = [WAIST_ACTION_SCALE] * 3
+        self._action_scales = torch.tensor(
+            leg_scales + waist_scales, dtype=torch.float32, device=device
+        )
+
+        # V6.2 internal state
+        self._prev_act = torch.zeros(num_envs, 15, device=device)
+        self._phase = torch.zeros(num_envs, device=device)
+        self._height_cmd = torch.ones(num_envs, device=device) * HEIGHT_DEFAULT
+        self._torso_cmd = torch.zeros(num_envs, 3, device=device)
+
+        # Gravity vector (constant)
+        self._gravity_vec = torch.tensor(
+            [0.0, 0.0, -1.0], dtype=torch.float32, device=device
+        )
+
+        # Initial positions (set in reset)
         self._initial_pos: Optional[torch.Tensor] = None
         self._is_reset = False
 
-        print(f"[HierarchicalG1Env] {num_envs} envs, device={device}")
-        print(f"[HierarchicalG1Env] Control: {1.0/self.control_dt:.0f} Hz "
+        print(f"[HierarchicalG1Env V6.2] {num_envs} envs, device={device}")
+        print(f"[HierarchicalG1Env V6.2] Control: {1.0/self.control_dt:.0f} Hz "
               f"({self.decimation}x decimation)")
+        print(f"[HierarchicalG1Env V6.2] Joints: 15 loco + 14 arm + 14 finger = 43")
 
+    # --------------------------------------------------------------------- #
+    # Joint index resolution
+    # --------------------------------------------------------------------- #
     def _resolve_joint_indices(self):
-        """
-        Find body vs finger joint indices in the articulation.
-
-        Isaac Lab's joint ordering comes from the USD, which may differ
-        from the SDK ordering. We match by joint name keywords.
-        """
+        """Map LOCO/ARM/HAND joint names to robot's articulation indices."""
         joint_names = self.robot.joint_names
-        total_joints = len(joint_names)
+        total = len(joint_names)
 
-        finger_keywords = ["_hand_index_", "_hand_middle_", "_hand_thumb_"]
+        # Find loco joint indices (must all exist)
+        loco_idx = []
+        for name in LOCO_JOINT_NAMES:
+            if name not in joint_names:
+                raise RuntimeError(f"Loco joint '{name}' not found in robot! "
+                                   f"Available: {joint_names}")
+            loco_idx.append(joint_names.index(name))
+        self._loco_idx = torch.tensor(loco_idx, device=self.device, dtype=torch.long)
 
-        body_ids = []
-        finger_ids = []
-        for i, name in enumerate(joint_names):
-            if any(kw in name for kw in finger_keywords):
-                finger_ids.append(i)
-            else:
-                body_ids.append(i)
+        # Find arm joint indices
+        arm_idx = []
+        for name in ARM_JOINT_NAMES:
+            if name not in joint_names:
+                raise RuntimeError(f"Arm joint '{name}' not found in robot!")
+            arm_idx.append(joint_names.index(name))
+        self._arm_idx = torch.tensor(arm_idx, device=self.device, dtype=torch.long)
 
-        self._body_joint_ids = torch.tensor(body_ids, device=self.device, dtype=torch.long)
-        self._finger_joint_ids = torch.tensor(finger_ids, device=self.device, dtype=torch.long)
+        # Find hand joint indices
+        hand_idx = []
+        for name in HAND_JOINT_NAMES:
+            if name not in joint_names:
+                raise RuntimeError(f"Hand joint '{name}' not found in robot!")
+            hand_idx.append(joint_names.index(name))
+        self._hand_idx = torch.tensor(hand_idx, device=self.device, dtype=torch.long)
 
-        # Within body joints, find arm vs leg+waist
-        arm_keywords = ["_shoulder_", "_elbow_", "_wrist_"]
-        arm_ids_global = []
-        leg_waist_ids_global = []
-        arm_local_indices = []
-        for local_idx, global_idx in enumerate(body_ids):
-            name = joint_names[global_idx]
-            if any(kw in name for kw in arm_keywords):
-                arm_ids_global.append(global_idx)
-                arm_local_indices.append(local_idx)
-            else:
-                leg_waist_ids_global.append(global_idx)
+        self._indices_resolved = True
 
-        self._arm_joint_ids = torch.tensor(arm_ids_global, device=self.device, dtype=torch.long)
-        self._leg_waist_joint_ids = torch.tensor(
-            leg_waist_ids_global, device=self.device, dtype=torch.long
-        )
-        self._arm_local_indices = torch.tensor(
-            arm_local_indices, device=self.device, dtype=torch.long
-        )
-
-        print(f"[HierarchicalG1Env] Joint mapping: "
-              f"{len(body_ids)} body ({len(leg_waist_ids_global)} leg+waist, "
-              f"{len(arm_ids_global)} arm) + {len(finger_ids)} finger = {total_joints}")
-        print(f"[HierarchicalG1Env] Body joint names: {[joint_names[i] for i in body_ids[:5]]}...")
-        print(f"[HierarchicalG1Env] Finger joint names: {[joint_names[i] for i in finger_ids[:5]]}...")
+        print(f"[HierarchicalG1Env V6.2] Joint mapping resolved ({total} total):")
+        print(f"  Loco (15): {[joint_names[i] for i in loco_idx[:4]]}...")
+        print(f"  Arm  (14): {[joint_names[i] for i in arm_idx[:4]]}...")
+        print(f"  Hand (14): {[joint_names[i] for i in hand_idx[:4]]}...")
 
     # --------------------------------------------------------------------- #
     # Public API
@@ -272,86 +523,78 @@ class HierarchicalG1Env:
         """Toggle between walking mode and manipulation mode."""
         self._manipulation_mode = enabled
         mode_name = "MANIPULATION" if enabled else "WALKING"
-        print(f"[HierarchicalG1Env] Mode: {mode_name}")
+        print(f"[HierarchicalG1Env V6.2] Mode: {mode_name}")
 
     def reset(self) -> dict:
         """Reset the environment and return initial observations."""
-        # First-time reset: initialize the simulation
         if not self._is_reset:
             self.sim.reset()
             self._is_reset = True
 
-        # Reset all scene entities to their initial states
+        # Reset all scene entities
         indices = torch.arange(self.num_envs, device=self.device)
         self.robot.reset(indices)
         self.table.reset(indices)
         self.cup.reset(indices)
 
-        # Write resets to sim and step once to apply
+        # Write resets to sim and step once
         self.scene.write_data_to_sim()
         self.sim.step()
         self.scene.update(self.physics_dt)
 
-        # Resolve joint indices (only once)
-        if self._body_joint_ids is None:
+        # Resolve joint indices (first time only)
+        if not self._indices_resolved:
             self._resolve_joint_indices()
 
-        # Reset policy history and finger controller
-        self.loco_policy.reset()
+        # Reset V6.2 state
+        self._prev_act.zero_()
+        self._phase[:] = torch.rand(self.num_envs, device=self.device)
+        self._height_cmd[:] = HEIGHT_DEFAULT
+        self._torso_cmd.zero_()
+
+        # Reset controllers
         self.finger_controller.reset()
+        self.arm_controller.reset()
         self.step_count = 0
         self._manipulation_mode = False
 
-        # CRITICAL: override policy default_joint_pos with the robot's
-        # actual default positions (Isaac Lab joint ordering, body joints only)
-        default_jpos_all = self.robot.data.default_joint_pos[:self.num_envs].clone()
-        default_jpos_body = default_jpos_all[:, self._body_joint_ids]
-        self.loco_policy.default_joint_pos = default_jpos_body
-
-        # Store initial XY positions for relative target computation
+        # Store initial XY positions
         self._initial_pos = self.robot.data.root_pos_w[:, :2].clone()
 
         return self.get_obs()
 
     def step(self, velocity_command: torch.Tensor) -> dict:
         """
-        Step the environment in WALKING mode.
+        Step in WALKING mode.
 
-        Loco policy controls all 29 body joints.
-        Finger controller provides finger targets independently.
+        Loco policy controls legs+waist (15).
+        Arms held at default (14).
+        Fingers from controller (14).
 
         Args:
-            velocity_command: [num_envs, 3] velocity in body frame [vx, vy, vyaw]
+            velocity_command: [N, 3] = [vx, vy, vyaw] in body frame
 
         Returns:
-            obs_dict with robot proprioception.
+            obs_dict
         """
-        obs = self.get_obs()
+        # Build V6.2 obs and get loco actions
+        loco_targets = self._run_loco_policy(velocity_command)
 
-        # Locomotion policy: velocity command -> 29 body joint targets
-        with torch.inference_mode():
-            body_targets = self.loco_policy.get_action(
-                base_ang_vel=obs["base_ang_vel"],
-                projected_gravity=obs["projected_gravity"],
-                joint_pos=obs["joint_pos_body"],
-                joint_vel=obs["joint_vel_body"],
-                velocity_command=velocity_command,
-            )
+        # Arm targets: default pose
+        arm_targets = self._default_arm.unsqueeze(0).expand(self.num_envs, -1)
 
-        # Finger targets from controller
+        # Finger targets
         finger_targets = self.finger_controller.get_targets()
 
-        # Combine into full 43-DoF targets
-        self._apply_joint_targets(body_targets, finger_targets)
+        # Apply all targets
+        self._apply_targets(loco_targets, arm_targets, finger_targets)
 
-        # Physics sub-stepping with decimation
+        # Physics sub-stepping
         for _ in range(self.decimation):
             self.scene.write_data_to_sim()
             self.sim.step()
 
-        # Update scene data
         self.scene.update(self.control_dt)
-
         self.step_count += 1
         return self.get_obs()
 
@@ -361,122 +604,209 @@ class HierarchicalG1Env:
         arm_targets: torch.Tensor,
     ) -> dict:
         """
-        Step the environment in MANIPULATION mode.
+        Step in MANIPULATION mode.
 
-        Loco policy controls legs+waist (15 joints).
-        Arm targets provided externally (14 joints).
-        Finger controller provides finger targets (14 joints).
+        Loco policy controls legs+waist (15).
+        Arm targets provided externally (14).
+        Fingers from controller (14).
 
         Args:
-            velocity_command: [num_envs, 3] velocity for leg balance
-            arm_targets: [num_envs, 14] absolute arm joint positions
+            velocity_command: [N, 3] velocity for leg balance
+            arm_targets: [N, 14] absolute arm joint positions
 
         Returns:
-            obs_dict with robot proprioception.
+            obs_dict
         """
-        obs = self.get_obs()
+        # Build V6.2 obs and get loco actions
+        loco_targets = self._run_loco_policy(velocity_command)
 
-        # Locomotion policy: get full 29 body targets (we'll override arms)
-        with torch.inference_mode():
-            body_targets = self.loco_policy.get_action(
-                base_ang_vel=obs["base_ang_vel"],
-                projected_gravity=obs["projected_gravity"],
-                joint_pos=obs["joint_pos_body"],
-                joint_vel=obs["joint_vel_body"],
-                velocity_command=velocity_command,
-            )
-
-        # Override arm joints with external targets
-        # Clone needed because body_targets is an inference tensor
-        body_targets = body_targets.clone()
-        body_targets[:, self._arm_local_indices] = arm_targets
-
-        # Finger targets from controller
+        # Finger targets
         finger_targets = self.finger_controller.get_targets()
 
-        # Combine into full 43-DoF targets
-        self._apply_joint_targets(body_targets, finger_targets)
+        # Apply all targets
+        self._apply_targets(loco_targets, arm_targets, finger_targets)
 
-        # Physics sub-stepping with decimation
+        # Physics sub-stepping
         for _ in range(self.decimation):
             self.scene.write_data_to_sim()
             self.sim.step()
 
-        # Update scene data
         self.scene.update(self.control_dt)
-
         self.step_count += 1
         return self.get_obs()
 
-    def _apply_joint_targets(
+    # --------------------------------------------------------------------- #
+    # V6.2 observation building and policy inference
+    # --------------------------------------------------------------------- #
+    def _build_loco_obs(self, velocity_command: torch.Tensor) -> torch.Tensor:
+        """
+        Build 66-dim observation matching V6.2 training exactly.
+
+        Order:
+            lin_vel_b(3) + ang_vel_b(3) + proj_gravity(3)
+            + jp_leg(12) + jv_leg*0.1(12) + jp_waist(3) + jv_waist*0.1(3)
+            + height_cmd(1) + vel_cmd(3) + gait(2) + prev_act(15)
+            + torso_euler(3) + torso_cmd(3)
+            = 66
+        """
+        n = self.num_envs
+        r = self.robot
+        q = r.data.root_quat_w  # wxyz
+
+        # Body-frame velocities (matching V6.2 computation)
+        lin_vel_b = quat_apply_inverse(q, r.data.root_lin_vel_w)
+        ang_vel_b = quat_apply_inverse(q, r.data.root_ang_vel_w)
+        proj_gravity = quat_apply_inverse(
+            q, self._gravity_vec.expand(n, -1)
+        )
+
+        # Loco joint positions and velocities (in LOCO_JOINT_NAMES order)
+        jp_all = r.data.joint_pos
+        jv_all = r.data.joint_vel
+
+        jp_leg = jp_all[:, self._loco_idx[:12]]
+        jv_leg = jv_all[:, self._loco_idx[:12]] * 0.1
+        jp_waist = jp_all[:, self._loco_idx[12:15]]
+        jv_waist = jv_all[:, self._loco_idx[12:15]] * 0.1
+
+        # Gait phase
+        gait = torch.stack([
+            torch.sin(2 * math.pi * self._phase),
+            torch.cos(2 * math.pi * self._phase),
+        ], dim=-1)
+
+        # Torso euler from wxyz quaternion
+        torso_euler = quat_to_euler_xyz_wxyz(q)
+
+        # Assemble 66-dim observation
+        obs = torch.cat([
+            lin_vel_b,                         # 3
+            ang_vel_b,                         # 3
+            proj_gravity,                      # 3
+            jp_leg, jv_leg,                    # 24
+            jp_waist, jv_waist,                # 6
+            self._height_cmd[:, None],         # 1
+            velocity_command,                   # 3
+            gait,                               # 2
+            self._prev_act,                    # 15
+            torso_euler,                        # 3
+            self._torso_cmd,                   # 3
+        ], dim=-1)  # = 66
+
+        return obs.clamp(-10, 10).nan_to_num()
+
+    def _run_loco_policy(self, velocity_command: torch.Tensor) -> torch.Tensor:
+        """
+        Build obs, run V6.2 loco policy, convert to absolute joint targets.
+
+        Returns:
+            loco_targets: [N, 15] absolute joint position targets
+                          in LOCO_JOINT_NAMES order
+        """
+        # Build 66-dim obs
+        obs = self._build_loco_obs(velocity_command)
+
+        # Run network
+        with torch.inference_mode():
+            raw_actions = self.loco_policy.get_raw_action(obs)
+
+        # Convert to absolute targets: default + actions * scales
+        targets = (
+            self._default_loco.unsqueeze(0)
+            + raw_actions * self._action_scales.unsqueeze(0)
+        )
+
+        # Waist clamp (V6.2 training match)
+        targets[:, 12].clamp_(-0.15, 0.15)   # waist_yaw
+        targets[:, 13].clamp_(-0.15, 0.15)   # waist_roll
+        targets[:, 14].clamp_(-0.2, 0.2)     # waist_pitch
+
+        # Hip yaw clamp (V6.1+: prevent scissor gait)
+        targets[:, 4].clamp_(-0.3, 0.3)      # left_hip_yaw
+        targets[:, 5].clamp_(-0.3, 0.3)      # right_hip_yaw
+
+        # Update V6.2 state
+        self._prev_act = raw_actions.clone()
+        self._phase = (self._phase + GAIT_FREQUENCY * CONTROL_DT) % 1.0
+
+        return targets
+
+    # --------------------------------------------------------------------- #
+    # Joint target application
+    # --------------------------------------------------------------------- #
+    def _apply_targets(
         self,
-        body_targets: torch.Tensor,
+        loco_targets: torch.Tensor,
+        arm_targets: torch.Tensor,
         finger_targets: torch.Tensor,
     ):
         """
-        Apply body + finger joint position targets to the 43-DoF robot.
+        Set joint position targets for all 43 DoF.
 
         Args:
-            body_targets: [num_envs, 29] body joint positions
-            finger_targets: [num_envs, 14] finger joint positions
+            loco_targets: [N, 15] legs+waist in LOCO_JOINT_NAMES order
+            arm_targets:  [N, 14] arms in ARM_JOINT_NAMES order
+            finger_targets: [N, 14] fingers in HAND_JOINT_NAMES order
         """
-        n = body_targets.shape[0]
-        total_joints = len(self._body_joint_ids) + len(self._finger_joint_ids)
+        # Start from robot defaults (handles any unmapped joints)
+        tgt = self.robot.data.default_joint_pos.clone()
 
-        full_targets = torch.zeros(
-            n, total_joints, dtype=torch.float32, device=self.device
-        )
+        # Place targets at correct global indices
+        tgt[:, self._loco_idx] = loco_targets
+        tgt[:, self._arm_idx] = arm_targets
+        tgt[:, self._hand_idx] = finger_targets
 
-        # Place body targets at correct indices
-        full_targets[:, self._body_joint_ids] = body_targets
-        # Place finger targets at correct indices
-        full_targets[:, self._finger_joint_ids] = finger_targets
+        self.robot.set_joint_position_target(tgt)
 
-        self.robot.set_joint_position_target(full_targets)
-
+    # --------------------------------------------------------------------- #
+    # Observations
+    # --------------------------------------------------------------------- #
     def get_obs(self) -> dict:
         """
-        Get current robot observations.
+        Get robot observations for the skill layer.
 
-        Returns dict compatible with the skill interface:
-            root_pos          : [N, 3]   world position
-            root_quat         : [N, 4]   orientation (w, x, y, z)
-            base_ang_vel      : [N, 3]   angular velocity in body frame
-            projected_gravity : [N, 3]   gravity vector in body frame
-            joint_pos_body    : [N, 29]  body joint positions (Isaac Lab order)
-            joint_vel_body    : [N, 29]  body joint velocities (Isaac Lab order)
-            joint_pos_finger  : [N, 14]  finger joint positions
-            joint_vel_finger  : [N, 14]  finger joint velocities
-            joint_pos         : [N, 29]  alias for joint_pos_body (backward compat)
-            joint_vel         : [N, 29]  alias for joint_vel_body (backward compat)
-            base_height       : [N]      robot base height
+        Returns dict with:
+            root_pos          : [N, 3]  world position
+            root_quat         : [N, 4]  wxyz quaternion
+            base_ang_vel      : [N, 3]  angular velocity in body frame
+            projected_gravity : [N, 3]  gravity in body frame
+            base_height       : [N]     base height (z)
+            joint_pos_loco    : [N, 15] loco joint positions
+            joint_vel_loco    : [N, 15] loco joint velocities
+            joint_pos_arm     : [N, 14] arm joint positions
+            joint_vel_arm     : [N, 14] arm joint velocities
+            joint_pos_finger  : [N, 14] finger joint positions
+            joint_vel_finger  : [N, 14] finger joint velocities
+            base_lin_vel      : [N, 3]  linear velocity in body frame
         """
-        all_pos = self.robot.data.joint_pos
-        all_vel = self.robot.data.joint_vel
-
-        body_pos = all_pos[:, self._body_joint_ids]
-        body_vel = all_vel[:, self._body_joint_ids]
-        finger_pos = all_pos[:, self._finger_joint_ids]
-        finger_vel = all_vel[:, self._finger_joint_ids]
+        jp = self.robot.data.joint_pos
+        jv = self.robot.data.joint_vel
+        q = self.robot.data.root_quat_w
 
         return {
             "root_pos": self.robot.data.root_pos_w,
-            "root_quat": self.robot.data.root_quat_w,
-            "base_ang_vel": self.robot.data.root_ang_vel_b,
-            "projected_gravity": self.robot.data.projected_gravity_b,
-            "joint_pos_body": body_pos,
-            "joint_vel_body": body_vel,
-            "joint_pos_finger": finger_pos,
-            "joint_vel_finger": finger_vel,
-            # Backward compatibility (skills expect "joint_pos" / "joint_vel")
-            "joint_pos": body_pos,
-            "joint_vel": body_vel,
+            "root_quat": q,
+            "base_ang_vel": quat_apply_inverse(q, self.robot.data.root_ang_vel_w),
+            "projected_gravity": quat_apply_inverse(
+                q, self._gravity_vec.expand(self.num_envs, -1)),
             "base_height": self.robot.data.root_pos_w[:, 2],
+            "base_lin_vel": quat_apply_inverse(q, self.robot.data.root_lin_vel_w),
+            "joint_pos_loco": jp[:, self._loco_idx],
+            "joint_vel_loco": jv[:, self._loco_idx],
+            "joint_pos_arm": jp[:, self._arm_idx],
+            "joint_vel_arm": jv[:, self._arm_idx],
+            "joint_pos_finger": jp[:, self._hand_idx],
+            "joint_vel_finger": jv[:, self._hand_idx],
+            # Backward compatibility aliases
+            "joint_pos": jp[:, self._loco_idx],
+            "joint_vel": jv[:, self._loco_idx],
+            "joint_pos_body": torch.cat([jp[:, self._loco_idx], jp[:, self._arm_idx]], dim=-1),
+            "joint_vel_body": torch.cat([jv[:, self._loco_idx], jv[:, self._arm_idx]], dim=-1),
         }
 
     @property
     def initial_positions(self) -> torch.Tensor:
-        """Initial XY positions of all robots [num_envs, 2]."""
+        """Initial XY positions [num_envs, 2]."""
         if self._initial_pos is None:
             raise RuntimeError("Call reset() first")
         return self._initial_pos

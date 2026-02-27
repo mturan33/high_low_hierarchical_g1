@@ -9,13 +9,18 @@ Strategy:
   - Smooth interpolation between poses
   - No external IK library dependency (pure PyTorch, Windows compatible)
 
-Arm joints per side (7):
+Arm joints per side (7) in ARM_JOINT_NAMES order:
   shoulder_pitch, shoulder_roll, shoulder_yaw,
   elbow,
   wrist_roll, wrist_pitch, wrist_yaw
 
-The controller outputs 14 joint position targets that override
-the locomotion policy's arm outputs during manipulation mode.
+Default poses match V6.2 training config (ulc_g1_29dof_cfg.py).
+The controller outputs 14 joint position targets for ARM_JOINT_NAMES order.
+
+IMPORTANT: V6.2 loco policy does NOT control arms, so arm movements
+don't conflict with locomotion. However, large arm movements shift
+the center of mass and may destabilize the robot. Use conservative
+poses, especially while walking.
 """
 
 from __future__ import annotations
@@ -47,25 +52,27 @@ class ArmPose(Enum):
 # Values are absolute positions in radians.
 # ============================================================================
 
-# Default standing pose (from UNITREE_G1_29DOF_CFG init_state)
-_DEFAULT_LEFT = [0.3, 0.25, 0.0, 0.97, 0.15, 0.0, 0.0]
-_DEFAULT_RIGHT = [0.3, -0.25, 0.0, 0.97, -0.15, 0.0, 0.0]
+# Default standing pose — MUST match V6.2 training config (ulc_g1_29dof_cfg.py)
+# [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw]
+_DEFAULT_LEFT = [0.35, 0.18, 0.0, 0.87, 0.0, 0.0, 0.0]
+_DEFAULT_RIGHT = [0.35, -0.18, 0.0, 0.87, 0.0, 0.0, 0.0]
 
-# Reach forward: arms straight ahead at chest height, palms down
-_REACH_FWD_LEFT = [-0.8, 0.15, 0.0, 0.3, 0.0, -0.5, 0.0]
-_REACH_FWD_RIGHT = [-0.8, -0.15, 0.0, 0.3, 0.0, -0.5, 0.0]
+# Reach forward: CONSERVATIVE — small shoulder pitch change to minimize CoM shift
+# Default shoulder_pitch=0.35, this goes to 0.05 (~17 deg more forward)
+_REACH_FWD_LEFT = [0.05, 0.15, 0.0, 0.60, 0.0, -0.15, 0.0]
+_REACH_FWD_RIGHT = [0.05, -0.15, 0.0, 0.60, 0.0, -0.15, 0.0]
 
-# Reach down: arms reaching to table level (~0.75m high)
-_REACH_DOWN_LEFT = [-1.0, 0.1, 0.0, 0.6, 0.0, -0.8, 0.0]
-_REACH_DOWN_RIGHT = [-1.0, -0.1, 0.0, 0.6, 0.0, -0.8, 0.0]
+# Reach down: arms reaching to table level (~0.75m high), conservative
+_REACH_DOWN_LEFT = [-0.1, 0.12, 0.0, 0.50, 0.0, -0.3, 0.0]
+_REACH_DOWN_RIGHT = [-0.1, -0.12, 0.0, 0.50, 0.0, -0.3, 0.0]
 
-# Reach table: arms extended to table surface, palms facing down
-_REACH_TABLE_LEFT = [-0.9, 0.1, 0.0, 0.4, 0.0, -1.2, 0.0]
-_REACH_TABLE_RIGHT = [-0.9, -0.1, 0.0, 0.4, 0.0, -1.2, 0.0]
+# Reach table: arms more extended toward table surface
+_REACH_TABLE_LEFT = [-0.2, 0.10, 0.0, 0.40, 0.0, -0.5, 0.0]
+_REACH_TABLE_RIGHT = [-0.2, -0.10, 0.0, 0.40, 0.0, -0.5, 0.0]
 
-# Carry: elbows bent, hands in front of torso
-_CARRY_LEFT = [-0.4, 0.2, 0.0, 1.4, 0.0, -0.3, 0.0]
-_CARRY_RIGHT = [-0.4, -0.2, 0.0, 1.4, 0.0, -0.3, 0.0]
+# Carry: elbows bent, hands in front of torso (mild change from default)
+_CARRY_LEFT = [0.15, 0.18, 0.0, 1.10, 0.0, -0.15, 0.0]
+_CARRY_RIGHT = [0.15, -0.18, 0.0, 1.10, 0.0, -0.15, 0.0]
 
 # Pose lookup table: {pose_name: (left_7, right_7)}
 _POSE_TABLE = {

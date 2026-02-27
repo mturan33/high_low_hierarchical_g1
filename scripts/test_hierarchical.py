@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Test Hierarchical G1 - Walk + Reach + Grasp Demo
-===================================================
-Full hierarchical manipulation demo:
+Test Hierarchical G1 (V6.2 Loco) - Walk + Reach + Grasp Demo
+===============================================================
+Full hierarchical manipulation demo using V6.2 loco policy:
   Phase 1: Walk to table (3m forward)
-  Phase 2: Switch to manipulation mode, reach forward
-  Phase 3: Close fingers (grasp)
-  Phase 4: Return arms to carry pose
-  Phase 5: Stand still (holding object)
+  Phase 2: Stabilize (stand still)
+  Phase 3: Switch to manipulation mode, reach forward
+  Phase 4: Close fingers (grasp)
+  Phase 5: Return arms to carry pose
+  Phase 6: Return to default + open fingers
+
+KEY CHANGE: V6.2 loco policy controls ONLY legs+waist (15 joints).
+Arms are controlled separately by ArmController. No more arm override
+conflict -- the loco policy never touches arms.
+
+V6.2 checkpoint format: {"model": {"actor.0.weight": ...}, "iteration": ...}
+Architecture: 66 obs -> [512,256,128](LN+ELU) -> 15 loco actions
 
 Usage (from C:\\IsaacLab):
-    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\high_low_hierarchical_g1\\scripts\\test_hierarchical.py --num_envs 16 --checkpoint C:\\IsaacLab\\logs\\rsl_rl\\unitree_g1_29dof_velocity\\2026-02-24_16-51-25\\model_20700.pt
+    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\high_low_hierarchical_g1\\scripts\\test_hierarchical.py --num_envs 16 --checkpoint C:\\IsaacLab\\logs\\ulc\\g1_unified_stage1_2026-02-27_00-05-20\\model_best.pt
 """
 
 # ============================================================================
@@ -20,14 +28,14 @@ import argparse
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Test hierarchical G1 DEX3 walk + reach + grasp")
+parser = argparse.ArgumentParser(description="Test hierarchical G1 V6.2 walk + reach + grasp")
 parser.add_argument("--num_envs", type=int, default=16, help="Number of environments")
 parser.add_argument(
     "--checkpoint", type=str, required=True,
-    help="Path to trained locomotion policy checkpoint (.pt file)",
+    help="Path to trained V6.2 loco policy checkpoint (.pt file)",
 )
 parser.add_argument("--walk_distance", type=float, default=3.0, help="Walk distance in meters")
-parser.add_argument("--max_steps", type=int, default=2000, help="Maximum steps before timeout")
+parser.add_argument("--max_steps", type=int, default=2000, help="Maximum walk steps before timeout")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -43,6 +51,9 @@ import sys
 import time
 import torch
 
+# Force unbuffered stdout for real-time output in headless mode
+sys.stdout.reconfigure(line_buffering=True)
+
 import isaaclab.sim as sim_utils
 
 # Add parent of high_low_hierarchical_g1 to path so package imports work
@@ -51,7 +62,9 @@ _PKG_PARENT = os.path.dirname(_PKG_DIR)
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 
-from high_low_hierarchical_g1.envs.hierarchical_env import HierarchicalG1Env, HierarchicalSceneCfg, PHYSICS_DT
+from high_low_hierarchical_g1.envs.hierarchical_env import (
+    HierarchicalG1Env, HierarchicalSceneCfg, PHYSICS_DT,
+)
 from high_low_hierarchical_g1.skills.walk_to import WalkToSkill
 from high_low_hierarchical_g1.config.skill_config import WalkToConfig
 from high_low_hierarchical_g1.low_level.arm_controller import ArmPose
@@ -59,9 +72,9 @@ from high_low_hierarchical_g1.low_level.arm_controller import ArmPose
 
 def run_phase(env, name, step_fn, max_steps=500, log_interval=50):
     """Run a phase with logging."""
-    print(f"\n{'─'*50}")
+    print(f"\n{'-'*50}")
     print(f"  PHASE: {name}")
-    print(f"{'─'*50}")
+    print(f"{'-'*50}")
 
     for step in range(max_steps):
         if not simulation_app.is_running():
@@ -83,11 +96,12 @@ def main():
     device = "cuda:0"
 
     print("=" * 60)
-    print("  Hierarchical G1 DEX3 - Walk + Reach + Grasp Demo")
+    print("  Hierarchical G1 V6.2 - Walk + Reach + Grasp Demo")
     print("=" * 60)
     print(f"  Environments : {num_envs}")
     print(f"  Checkpoint   : {args_cli.checkpoint}")
     print(f"  Walk distance: {args_cli.walk_distance}m")
+    print(f"  Loco policy  : V6.2 (66 obs -> 15 act, LN+ELU)")
     print("=" * 60)
 
     # ------------------------------------------------------------------
@@ -110,7 +124,7 @@ def main():
     sim.set_camera_view(eye=[8.0, -4.0, 3.5], target=[3.0, 0.0, 0.5])
 
     # ------------------------------------------------------------------
-    # 2. Create hierarchical environment (DEX3)
+    # 2. Create hierarchical environment (V6.2 + DEX3)
     # ------------------------------------------------------------------
     scene_cfg = HierarchicalSceneCfg()
     env = HierarchicalG1Env(
@@ -141,9 +155,9 @@ def main():
     skill = WalkToSkill(config=walk_cfg, device=device)
     skill.reset(target_positions=target_positions)
 
-    print(f"\n{'─'*50}")
+    print(f"\n{'-'*50}")
     print(f"  PHASE 1: Walk to table ({args_cli.walk_distance}m)")
-    print(f"{'─'*50}")
+    print(f"{'-'*50}")
 
     start_time = time.time()
     walk_done = False
@@ -182,9 +196,9 @@ def main():
     # ==================================================================
     # PHASE 3: Reach forward (manipulation mode)
     # ==================================================================
-    print(f"\n{'─'*50}")
-    print(f"  PHASE 3: Reach forward (arm override)")
-    print(f"{'─'*50}")
+    print(f"\n{'-'*50}")
+    print(f"  PHASE 3: Reach forward (V6.2 -- no arm conflict)")
+    print(f"{'-'*50}")
 
     env.set_manipulation_mode(True)
     env.arm_controller.set_pose(ArmPose.REACH_FORWARD)
@@ -199,17 +213,18 @@ def main():
         if step % 50 == 0:
             h = obs["base_height"].mean().item()
             arm_done = env.arm_controller.is_done
+            standing = (obs["base_height"] > 0.5).sum().item()
             print(f"  [Reach] Step {step:4d} | Height: {h:.2f}m | "
-                  f"Arm done: {arm_done}")
+                  f"Standing: {standing}/{num_envs} | Arm done: {arm_done}")
 
     print(f"  [Reach] Arms in REACH_FORWARD position")
 
     # ==================================================================
     # PHASE 4: Close fingers (grasp)
     # ==================================================================
-    print(f"\n{'─'*50}")
+    print(f"\n{'-'*50}")
     print(f"  PHASE 4: Close fingers (grasp)")
-    print(f"{'─'*50}")
+    print(f"{'-'*50}")
 
     env.finger_controller.close(hand="both")
 
@@ -223,7 +238,8 @@ def main():
         if step % 25 == 0:
             finger_pos = obs["joint_pos_finger"]
             closed = env.finger_controller.is_closed()
-            print(f"  [Grasp] Step {step:4d} | "
+            h = obs["base_height"].mean().item()
+            print(f"  [Grasp] Step {step:4d} | Height: {h:.2f}m | "
                   f"Finger mean: {finger_pos.mean():.3f} rad | "
                   f"Closed: {closed}")
 
@@ -232,9 +248,9 @@ def main():
     # ==================================================================
     # PHASE 5: Move to carry pose (arms bent, holding object)
     # ==================================================================
-    print(f"\n{'─'*50}")
+    print(f"\n{'-'*50}")
     print(f"  PHASE 5: Carry pose")
-    print(f"{'─'*50}")
+    print(f"{'-'*50}")
 
     env.arm_controller.set_pose(ArmPose.CARRY)
 
@@ -248,15 +264,16 @@ def main():
         if step % 50 == 0:
             h = obs["base_height"].mean().item()
             arm_done = env.arm_controller.is_done
+            standing = (obs["base_height"] > 0.5).sum().item()
             print(f"  [Carry] Step {step:4d} | Height: {h:.2f}m | "
-                  f"Arm done: {arm_done}")
+                  f"Standing: {standing}/{num_envs} | Arm done: {arm_done}")
 
     # ==================================================================
     # PHASE 6: Return to default pose, open fingers
     # ==================================================================
-    print(f"\n{'─'*50}")
+    print(f"\n{'-'*50}")
     print(f"  PHASE 6: Return to default + open fingers")
-    print(f"{'─'*50}")
+    print(f"{'-'*50}")
 
     env.arm_controller.set_pose(ArmPose.DEFAULT)
     env.finger_controller.open(hand="both")
@@ -270,7 +287,9 @@ def main():
 
         if step % 50 == 0:
             h = obs["base_height"].mean().item()
-            print(f"  [Return] Step {step:4d} | Height: {h:.2f}m")
+            standing = (obs["base_height"] > 0.5).sum().item()
+            print(f"  [Return] Step {step:4d} | Height: {h:.2f}m | "
+                  f"Standing: {standing}/{num_envs}")
 
     # Switch back to walking mode
     env.set_manipulation_mode(False)
@@ -282,7 +301,7 @@ def main():
     distances = torch.norm(final_pos - target_positions, dim=-1)
 
     print("\n" + "=" * 60)
-    print("  DEMO RESULTS")
+    print("  DEMO RESULTS (V6.2 Loco)")
     print("=" * 60)
     print(f"  Walk          : {result.status.name} ({walk_time:.1f}s)")
     print(f"  Reach         : OK (arms extended forward)")
@@ -290,16 +309,21 @@ def main():
     print(f"  Carry         : OK (arms in carry pose)")
     print(f"  Return        : OK (arms back to default)")
     print(f"  Final height  : {obs['base_height'].mean():.2f}m")
-    print(f"  Standing      : {(obs['base_height'] > 0.3).sum()}/{num_envs}")
-    print(f"  Total DoF     : {env.robot.num_joints} (29 body + {env.robot.num_joints - 29} fingers)")
+    print(f"  Standing      : {(obs['base_height'] > 0.5).sum()}/{num_envs}")
+    print(f"  Loco policy   : V6.2 (66->15, legs+waist only)")
+    print(f"  Total DoF     : 43 (15 loco + 14 arm + 14 finger)")
     print("=" * 60)
 
-    # Keep sim alive
-    print("\n[Demo] Complete! Keeping sim alive...")
-    while simulation_app.is_running():
-        obs = env.step(stand_cmd)
-
-    env.close()
+    # Keep sim alive (skip in headless mode)
+    if args_cli.headless:
+        print("\n[Demo] Complete! (headless mode - exiting)")
+        env.close()
+        simulation_app.close()
+    else:
+        print("\n[Demo] Complete! Keeping sim alive...")
+        while simulation_app.is_running():
+            obs = env.step(stand_cmd)
+        env.close()
 
 
 if __name__ == "__main__":
