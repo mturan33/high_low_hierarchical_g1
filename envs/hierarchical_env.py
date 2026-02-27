@@ -387,6 +387,8 @@ class HierarchicalG1Env:
             )
 
         # Override arm joints with external targets
+        # Clone needed because body_targets is an inference tensor
+        body_targets = body_targets.clone()
         body_targets[:, self._arm_local_indices] = arm_targets
 
         # Finger targets from controller
