@@ -38,7 +38,7 @@ parser.add_argument(
     "--arm_checkpoint", type=str, default=None,
     help="Path to Stage 7 arm policy checkpoint (.pt file). If provided, uses learned arm control.",
 )
-parser.add_argument("--walk_distance", type=float, default=3.2, help="Walk distance in meters")
+parser.add_argument("--walk_distance", type=float, default=3.0, help="Walk distance in meters")
 parser.add_argument("--max_steps", type=int, default=2000, help="Maximum walk steps before timeout")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()

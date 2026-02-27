@@ -89,25 +89,31 @@ NUM_DEX3_JOINTS_PER_HAND = 7
 ALL_JOINT_NAMES_DEX3 = ALL_JOINT_NAMES + DEX3_JOINT_NAMES  # 43 joints
 NUM_ALL_JOINTS_DEX3 = 43
 
-# Finger close positions (radians) — empirical values for power grasp
+# Finger close positions (radians) — derived from actual USD joint limits
+# Sign convention determined by joint limit ranges:
+#   Right index/middle: range [0, +1.57]    → close = POSITIVE
+#   Right thumb_0:      range [-1.05, +1.05] → close = NEGATIVE (opposition)
+#   Right thumb_1:      range [-1.05, +0.61] → close = NEGATIVE
+#   Right thumb_2:      range [-1.75, 0.00]  → close = NEGATIVE (only neg possible!)
+#   Left hand: MIRRORED — index/middle close NEGATIVE, thumb_1/thumb_2 close POSITIVE
 DEX3_FINGER_OPEN = {j: 0.0 for j in DEX3_JOINT_NAMES}
 DEX3_FINGER_CLOSE = {
-    # Left hand
-    "left_hand_index_0_joint": 0.8,
-    "left_hand_index_1_joint": 1.0,
-    "left_hand_middle_0_joint": 0.8,
-    "left_hand_middle_1_joint": 1.0,
-    "left_hand_thumb_0_joint": 0.6,
-    "left_hand_thumb_1_joint": 0.8,
-    "left_hand_thumb_2_joint": 0.6,
-    # Right hand
-    "right_hand_index_0_joint": 0.8,
-    "right_hand_index_1_joint": 1.0,
-    "right_hand_middle_0_joint": 0.8,
-    "right_hand_middle_1_joint": 1.0,
-    "right_hand_thumb_0_joint": 0.6,
-    "right_hand_thumb_1_joint": 0.8,
-    "right_hand_thumb_2_joint": 0.6,
+    # Left hand — index/middle close NEGATIVE, thumb_1/2 close POSITIVE
+    "left_hand_index_0_joint": -0.8,     # range [-1.571, 0.000]
+    "left_hand_index_1_joint": -1.0,     # range [-1.745, 0.000]
+    "left_hand_middle_0_joint": -0.8,    # range [-1.571, 0.000]
+    "left_hand_middle_1_joint": -1.0,    # range [-1.745, 0.000]
+    "left_hand_thumb_0_joint": 0.6,      # range [-1.047, +1.047] (opposition)
+    "left_hand_thumb_1_joint": 0.8,      # range [-0.611, +1.047]
+    "left_hand_thumb_2_joint": 0.6,      # range [+0.000, +1.745]
+    # Right hand — index/middle close POSITIVE, thumb_1/2 close NEGATIVE
+    "right_hand_index_0_joint": 0.8,     # range [+0.000, +1.571]
+    "right_hand_index_1_joint": 1.0,     # range [+0.000, +1.745]
+    "right_hand_middle_0_joint": 0.8,    # range [+0.000, +1.571]
+    "right_hand_middle_1_joint": 1.0,    # range [+0.000, +1.745]
+    "right_hand_thumb_0_joint": -0.6,    # range [-1.047, +1.047] (opposition)
+    "right_hand_thumb_1_joint": -0.8,    # range [-1.047, +0.611]
+    "right_hand_thumb_2_joint": -0.6,    # range [-1.745, +0.000]
 }
 
 # ============================================================================

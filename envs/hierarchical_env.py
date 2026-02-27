@@ -329,7 +329,9 @@ class HierarchicalSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # -- Red cup sitting on the table --
+    # -- Red cup near the FRONT of the table --
+    # Table front edge is at x=3.1. Cup at x=3.2 (10cm from edge)
+    # so the robot can physically reach it.
     cup: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Cup",
         spawn=sim_utils.CylinderCfg(
@@ -343,7 +345,7 @@ class HierarchicalSceneCfg(InteractiveSceneCfg):
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(3.5, 0.0, 0.80),
+            pos=(3.2, 0.0, 0.80),
         ),
     )
 
